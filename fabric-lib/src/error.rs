@@ -1,6 +1,6 @@
 use std::ffi::CStr;
 
-use cuda_lib::{driver::CudaDriverError, rt::CudartError};
+use crate::cuda_compat::{driver::CudaDriverError, rt::CudartError};
 use libfabric_sys::fi_strerror;
 use syscalls::Errno;
 

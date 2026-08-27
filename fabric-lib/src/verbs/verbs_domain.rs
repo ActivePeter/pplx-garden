@@ -7,7 +7,6 @@ use std::{
     sync::Arc,
 };
 
-use cuda_lib::Device;
 use libc::ENOMEM;
 use libibverbs_sys::{
     IBV_ACCESS_LOCAL_WRITE, IBV_ACCESS_RELAXED_ORDERING, IBV_ACCESS_REMOTE_READ,
@@ -36,6 +35,7 @@ const MAX_UD_SENDS: usize = 128;
 
 use crate::{
     api::{DomainAddress, MemoryRegionRemoteKey, PeerGroupHandle, TransferId},
+    cuda_compat::Device,
     error::{FabricLibError, Result, VerbsError},
     imm_count::{ImmCountMap, ImmCountStatus},
     mr::{Mapping, MemoryRegion, MemoryRegionLocalDescriptor},

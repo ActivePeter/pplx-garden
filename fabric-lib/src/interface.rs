@@ -7,10 +7,9 @@ use std::{
     sync::Arc,
 };
 
-use cuda_lib::Device;
-
 use crate::{
     api::{DomainAddress, MemoryRegionDescriptor, MemoryRegionHandle, TransferRequest},
+    cuda_compat::Device,
     error::{FabricLibError, Result},
 };
 

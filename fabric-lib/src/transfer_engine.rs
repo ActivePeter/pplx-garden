@@ -9,7 +9,6 @@ use std::{
     thread::JoinHandle,
 };
 
-use cuda_lib::{Device, gdr::GdrFlag};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
@@ -23,6 +22,7 @@ use crate::{
         MemoryRegionHandle, PeerGroupHandle, SmallVec, TransferCompletionEntry,
         TransferCounter, TransferId, TransferRequest, UvmWatcherId,
     },
+    cuda_compat::{Device, gdr::GdrFlag},
     error::Result,
     fabric_engine::FabricEngine,
     imm_count::ImmCount,

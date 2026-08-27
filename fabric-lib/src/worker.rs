@@ -9,7 +9,6 @@ use std::{
 };
 
 use crossbeam_channel::TryRecvError;
-use cuda_lib::CudaHostMemory;
 use thread_lib::pin_cpu;
 use tracing::{debug, warn};
 
@@ -19,6 +18,7 @@ use crate::{
         SmallVec, TransferCompletionEntry, TransferCounter, TransferId,
         TransferRequest, UvmWatcherId,
     },
+    cuda_compat::CudaHostMemory,
     domain_group::DomainGroup,
     efa::EfaDomain,
     error::{FabricLibError, Result},

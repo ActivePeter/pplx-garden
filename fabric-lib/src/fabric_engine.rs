@@ -9,7 +9,6 @@ use std::{
     },
 };
 
-use cuda_lib::{CudaDeviceId, Device, gdr::GdrFlag};
 use dashmap::DashMap;
 
 use crate::{
@@ -18,6 +17,7 @@ use crate::{
         MemoryRegionHandle, PeerGroupHandle, SmallVec, TransferCompletionEntry,
         TransferCounter, TransferId, TransferRequest, UvmWatcherId,
     },
+    cuda_compat::{CudaDeviceId, Device, gdr::GdrFlag},
     error::{FabricLibError, Result},
     imm_count::{ImmCount, ImmCountMap},
     mr::MemoryRegion,

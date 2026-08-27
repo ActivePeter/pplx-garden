@@ -10,8 +10,8 @@ use std::{
     },
 };
 
+use crate::cuda_compat::gdr::GdrFlag;
 use bytes::Bytes;
-use cuda_lib::gdr::GdrFlag;
 use serde::{Deserialize, Serialize};
 
 use crate::{
