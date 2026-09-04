@@ -93,6 +93,7 @@ impl TransferEngineBuilder {
                 domain_list,
                 pin_worker_cpu: Some(spec.pin_worker_cpu),
                 pin_uvm_cpu: Some(spec.pin_uvm_cpu),
+                polling_mode: crate::PollingMode::Busy,
             };
             workers.push((spec.cuda_device, worker));
         }

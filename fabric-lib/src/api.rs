@@ -19,6 +19,8 @@ use crate::{
     utils::hex::{fmt_hex, from_hex},
 };
 
+pub const MAX_GATHER_SEGMENTS: usize = 4;
+
 pub type SmallVec<T> = ::smallvec::SmallVec<[T; 4]>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,6 +51,8 @@ pub struct MemoryRegionDescriptor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransferId(pub u64);
+
+pub(crate) const REMOTE_CONFIRMED_OPERATION_BIT: u64 = 1 << 63;
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DomainAddress(pub Bytes);
@@ -136,6 +140,31 @@ pub struct SingleTransferRequest {
     pub domain: DomainGroupRouting,
 }
 
+/// One source segment in a gather write.
+#[derive(Clone, Debug)]
+pub struct GatherSegment {
+    pub src_mr: MemoryRegionHandle,
+    pub src_offset: u64,
+    pub length: u64,
+}
+
+/// Writes several registered source segments contiguously to one remote region.
+///
+/// All segments must belong to the same device, and at most [`MAX_GATHER_SEGMENTS`]
+/// are accepted. With sharded routing, the logical stream is split across domains and each
+/// domain posts one gather write. `imm_data` is attached to every shard, so receivers that use
+/// multiple domains must aggregate all matching notifications before consuming the payload.
+#[derive(Clone, Debug)]
+pub struct GatherTransferRequest {
+    /// Small RPC headers normally use two segments. Keep those descriptors inline instead of
+    /// allocating a Vec (and a second Arc allocation) for every submitted request and response.
+    pub segments: SmallVec<GatherSegment>,
+    pub imm_data: Option<u32>,
+    pub dst_mr: MemoryRegionDescriptor,
+    pub dst_offset: u64,
+    pub domain: DomainGroupRouting,
+}
+
 #[derive(Clone, Debug)]
 pub struct PagedTransferRequest {
     pub length: u64,
@@ -178,6 +207,7 @@ pub struct ScatterTransferRequest {
 pub enum TransferRequest {
     Imm(ImmTransferRequest),
     Single(SingleTransferRequest),
+    Gather(GatherTransferRequest),
     Paged(PagedTransferRequest),
     Scatter(ScatterTransferRequest),
     Barrier(BarrierTransferRequest),
@@ -240,11 +270,20 @@ impl GdrCounter {
 pub struct TransferCounter {
     counter: Arc<AtomicI64>,
     err_counter: Arc<AtomicI64>,
+    _guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl TransferCounter {
     pub fn new(counter: Arc<AtomicI64>, err_counter: Arc<AtomicI64>) -> Self {
-        Self { counter, err_counter }
+        Self { counter, err_counter, _guard: None }
+    }
+
+    pub fn with_guard(
+        counter: Arc<AtomicI64>,
+        err_counter: Arc<AtomicI64>,
+        guard: Arc<dyn Send + Sync>,
+    ) -> Self {
+        Self { counter, err_counter, _guard: Some(guard) }
     }
 
     pub(crate) fn error(&self) {

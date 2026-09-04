@@ -14,7 +14,8 @@ use crate::{
     api::ScatterTarget,
     efa::EfaMemDesc,
     rdma_op::{
-        ImmWriteOp, PagedWriteOp, RecvOp, ScatterGroupWriteOp, SendOp, SingleWriteOp,
+        GatherWriteOp, ImmWriteOp, PagedWriteOp, RecvOp, ScatterGroupWriteOp, SendOp,
+        SingleWriteOp,
     },
 };
 
@@ -94,6 +95,74 @@ impl SingleWriteOpIter {
 
     pub fn mark_done(&mut self) {
         assert!(!self.done);
+        self.done = true;
+    }
+}
+
+pub struct GatherWriteOpIter {
+    msg: Box<fi_msg_rma>,
+    _iovs: Box<[iovec]>,
+    _descriptors: Box<[*mut c_void]>,
+    _rma_iov: Box<fi_rma_iov>,
+    flags: u64,
+    done: bool,
+}
+
+impl GatherWriteOpIter {
+    pub fn new(op: GatherWriteOp, addr: fi_addr_t, context: *mut c_void) -> Self {
+        assert!(!op.sources.is_empty());
+        let mut iovs = op
+            .sources
+            .iter()
+            .map(|source| iovec {
+                iov_base: unsafe {
+                    source.src_ptr.as_ptr().byte_add(source.src_offset as usize)
+                },
+                iov_len: source.length as usize,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut descriptors = op
+            .sources
+            .iter()
+            .map(|source| unsafe { *EfaMemDesc::from(source.src_desc).0 })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut rma_iov = Box::new(fi_rma_iov {
+            addr: op.dst_ptr + op.dst_offset,
+            len: op.length as usize,
+            key: op.dst_rkey.0,
+        });
+        let (imm, flags) = flags_imm(op.imm_data);
+        let msg = Box::new(fi_msg_rma {
+            msg_iov: iovs.as_mut_ptr(),
+            desc: descriptors.as_mut_ptr(),
+            iov_count: iovs.len(),
+            addr,
+            rma_iov: rma_iov.as_mut(),
+            rma_iov_count: 1,
+            context,
+            data: imm,
+        });
+        Self {
+            msg,
+            _iovs: iovs,
+            _descriptors: descriptors,
+            _rma_iov: rma_iov,
+            flags,
+            done: false,
+        }
+    }
+
+    pub fn peek(&self) -> (*mut fi_msg_rma, u64) {
+        if self.done {
+            (null_mut(), 0)
+        } else {
+            (self.msg.as_ref() as *const fi_msg_rma as *mut fi_msg_rma, self.flags)
+        }
+    }
+
+    pub fn mark_done(&mut self) {
         self.done = true;
     }
 }
@@ -304,6 +373,7 @@ impl ScatterWriteOpIter {
 
 pub enum WriteOpIter {
     Single(SingleWriteOpIter),
+    Gather(GatherWriteOpIter),
     Paged(PagedWriteOpIter),
     Scatter(ScatterWriteOpIter),
 }
@@ -312,6 +382,7 @@ impl WriteOpIter {
     pub fn total_ops(&self) -> usize {
         match self {
             WriteOpIter::Single(_) => 1,
+            WriteOpIter::Gather(_) => 1,
             WriteOpIter::Paged(iter) => iter.total_ops(),
             WriteOpIter::Scatter(iter) => iter.total_ops(),
         }
@@ -320,6 +391,7 @@ impl WriteOpIter {
     pub fn peek(&self) -> (*mut fi_msg_rma, u64) {
         match self {
             WriteOpIter::Single(iter) => iter.peek(),
+            WriteOpIter::Gather(iter) => iter.peek(),
             WriteOpIter::Paged(iter) => iter.peek(),
             WriteOpIter::Scatter(iter) => iter.peek(),
         }
@@ -328,6 +400,7 @@ impl WriteOpIter {
     pub fn advance(&mut self) {
         match self {
             WriteOpIter::Single(iter) => iter.mark_done(),
+            WriteOpIter::Gather(iter) => iter.mark_done(),
             WriteOpIter::Paged(iter) => iter.advance(),
             WriteOpIter::Scatter(iter) => iter.advance(),
         }

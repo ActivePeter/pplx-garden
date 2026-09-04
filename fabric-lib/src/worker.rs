@@ -6,21 +6,23 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering::SeqCst},
     },
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::TryRecvError;
 use thread_lib::pin_cpu;
 use tracing::{debug, warn};
 
+#[cfg(feature = "efa")]
+use crate::efa::EfaDomain;
 use crate::{
     api::{
         DomainAddress, MemoryRegionDescriptor, MemoryRegionHandle, PeerGroupHandle,
-        SmallVec, TransferCompletionEntry, TransferCounter, TransferId,
-        TransferRequest, UvmWatcherId,
+        REMOTE_CONFIRMED_OPERATION_BIT, SmallVec, TransferCompletionEntry,
+        TransferCounter, TransferId, TransferRequest, UvmWatcherId,
     },
     cuda_compat::CudaHostMemory,
     domain_group::DomainGroup,
-    efa::EfaDomain,
     error::{FabricLibError, Result},
     imm_count::ImmCountMap,
     mr::MemoryRegion,
@@ -42,6 +44,7 @@ pub enum WorkerCommand {
         ptr: NonNull<c_void>,
         len: usize,
         addr: DomainAddress,
+        coalescible: bool,
     },
     SubmitRecv {
         transfer_id: TransferId,
@@ -84,9 +87,84 @@ pub struct Worker {
     pub domain_list: Vec<DomainInfo>,
     pub pin_worker_cpu: Option<u16>,
     pub pin_uvm_cpu: Option<u16>,
+    pub polling_mode: PollingMode,
 }
 
 unsafe impl Send for Worker {}
+
+/// Controls how a fabric progress thread behaves after it stops observing work.
+///
+/// Busy polling remains the default for latency-sensitive primary data paths. Adaptive polling is
+/// intended for warm standby paths: it spins through short gaps, then sleeps until the next poll so
+/// an idle engine does not consume an entire CPU indefinitely.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PollingMode {
+    #[default]
+    Busy,
+    Adaptive {
+        spin_duration: Duration,
+        idle_sleep: Duration,
+    },
+}
+
+pub(crate) struct IdlePoller {
+    mode: PollingMode,
+    idle_since: Option<Instant>,
+    idle_polls: u32,
+    sleeping: bool,
+}
+
+impl IdlePoller {
+    const CLOCK_CHECK_INTERVAL: u32 = 64;
+
+    pub(crate) fn new(mode: PollingMode) -> Self {
+        Self { mode, idle_since: None, idle_polls: 0, sleeping: false }
+    }
+
+    #[inline]
+    pub(crate) fn wait(&mut self, active: bool) {
+        if active {
+            self.idle_since = None;
+            self.idle_polls = 0;
+            self.sleeping = false;
+            return;
+        }
+
+        let PollingMode::Adaptive { spin_duration, idle_sleep } = self.mode else {
+            std::hint::spin_loop();
+            return;
+        };
+
+        if self.sleeping {
+            Self::sleep(idle_sleep);
+            return;
+        }
+
+        let idle_since = self.idle_since.get_or_insert_with(Instant::now);
+        self.idle_polls = self.idle_polls.wrapping_add(1);
+        if self.idle_polls < Self::CLOCK_CHECK_INTERVAL {
+            std::hint::spin_loop();
+            return;
+        }
+        self.idle_polls = 0;
+
+        if idle_since.elapsed() >= spin_duration {
+            self.sleeping = true;
+            Self::sleep(idle_sleep);
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+
+    #[inline]
+    fn sleep(duration: Duration) {
+        if duration.is_zero() {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(duration);
+        }
+    }
+}
 
 pub struct InitializingWorker {
     worker_handle: std::thread::JoinHandle<()>,
@@ -101,7 +179,7 @@ struct InitializedWorker {
     aggregated_link_speed: u64,
     address_list: Vec<DomainAddress>,
     call_tx: crossbeam_channel::Sender<WorkerCall>,
-    cmd_tx: crossbeam_channel::Sender<Box<WorkerCommand>>,
+    cmd_tx: crossbeam_channel::Sender<WorkerCommand>,
 }
 
 struct InitializedUvmWatcher {
@@ -114,7 +192,7 @@ pub struct WorkerHandle {
     pub address_list: Vec<DomainAddress>,
     pub worker_call_tx: crossbeam_channel::Sender<WorkerCall>,
     pub uvm_call_tx: crossbeam_channel::Sender<UvmWatcherCall>,
-    pub cmd_tx: crossbeam_channel::Sender<Box<WorkerCommand>>,
+    pub cmd_tx: crossbeam_channel::Sender<WorkerCommand>,
     pub cq_rx: crossbeam_channel::Receiver<TransferCompletionEntry>,
     worker_stop_signal: Arc<AtomicBool>,
     worker_handle: std::thread::JoinHandle<()>,
@@ -138,66 +216,86 @@ impl Worker {
     pub fn spawn(self, imm_count_map: Arc<ImmCountMap>) -> Result<InitializingWorker> {
         let (init_worker_tx, init_worker_rx) = oneshot::channel();
         let (init_uvm_tx, init_uvm_rx) = oneshot::channel();
+        let polling_mode = self.polling_mode;
 
         // Dynamic dispatch to EFA or Verbs
         let total_domains = self.domain_list.len();
+        #[cfg(feature = "efa")]
         let mut efa_domain_list = Vec::new();
         let mut verbs_domain_list = Vec::new();
         for info in self.domain_list.into_iter() {
             match info {
+                #[cfg(feature = "efa")]
                 DomainInfo::Efa(info) => efa_domain_list.push(info),
                 DomainInfo::Verbs(info) => verbs_domain_list.push(info),
             }
         }
 
-        // Callback queue.
-        let (cq_tx, cq_rx) = crossbeam_channel::bounded(128);
+        // Completion callbacks may synchronously enqueue response or acknowledgement commands
+        // back to this worker. A bounded completion queue can therefore deadlock with the bounded
+        // command queue: the RDMA progress thread waits to publish a completion while the callback
+        // thread waits for that same progress thread to consume a command. Keep command admission
+        // bounded, but never block transport progress while publishing completions.
+        let (cq_tx, cq_rx) = crossbeam_channel::unbounded();
 
         // Spawn thread
         let worker_thread_builder =
             std::thread::Builder::new().name("tx_engine_domain_worker".to_string());
         let worker_cq_tx = cq_tx.clone();
-        let worker_handle = if efa_domain_list.len() == total_domains {
-            match efa_domain_list.len() {
-                1 => worker_thread_builder.spawn(move || {
-                    rdma_worker_thread::<EfaDomain, 1>(
-                        efa_domain_list,
-                        self.pin_worker_cpu,
-                        imm_count_map,
-                        init_worker_tx,
-                        worker_cq_tx,
-                    )
-                }),
-                2 => worker_thread_builder.spawn(move || {
-                    rdma_worker_thread::<EfaDomain, 2>(
-                        efa_domain_list,
-                        self.pin_worker_cpu,
-                        imm_count_map,
-                        init_worker_tx,
-                        worker_cq_tx,
-                    )
-                }),
-                4 => worker_thread_builder.spawn(move || {
-                    rdma_worker_thread::<EfaDomain, 4>(
-                        efa_domain_list,
-                        self.pin_worker_cpu,
-                        imm_count_map,
-                        init_worker_tx,
-                        worker_cq_tx,
-                    )
-                }),
-                _ => {
-                    return Err(FabricLibError::Custom(
-                        "Only support 1, 2, or 4 domains per GPU for EFA",
-                    ));
+        #[cfg(feature = "efa")]
+        let all_efa = efa_domain_list.len() == total_domains;
+        #[cfg(not(feature = "efa"))]
+        let all_efa = false;
+        let worker_handle = if all_efa {
+            #[cfg(feature = "efa")]
+            {
+                match efa_domain_list.len() {
+                    1 => worker_thread_builder.spawn(move || {
+                        rdma_worker_thread::<EfaDomain, 1>(
+                            efa_domain_list,
+                            self.pin_worker_cpu,
+                            polling_mode,
+                            imm_count_map,
+                            init_worker_tx,
+                            worker_cq_tx,
+                        )
+                    }),
+                    2 => worker_thread_builder.spawn(move || {
+                        rdma_worker_thread::<EfaDomain, 2>(
+                            efa_domain_list,
+                            self.pin_worker_cpu,
+                            polling_mode,
+                            imm_count_map,
+                            init_worker_tx,
+                            worker_cq_tx,
+                        )
+                    }),
+                    4 => worker_thread_builder.spawn(move || {
+                        rdma_worker_thread::<EfaDomain, 4>(
+                            efa_domain_list,
+                            self.pin_worker_cpu,
+                            polling_mode,
+                            imm_count_map,
+                            init_worker_tx,
+                            worker_cq_tx,
+                        )
+                    }),
+                    _ => {
+                        return Err(FabricLibError::Custom(
+                            "Only support 1, 2, or 4 domains per GPU for EFA",
+                        ));
+                    }
                 }
             }
+            #[cfg(not(feature = "efa"))]
+            unreachable!("EFA support is disabled")
         } else if verbs_domain_list.len() == total_domains {
             match verbs_domain_list.len() {
                 1 => worker_thread_builder.spawn(move || {
                     rdma_worker_thread::<VerbsDomain, 1>(
                         verbs_domain_list,
                         self.pin_worker_cpu,
+                        polling_mode,
                         imm_count_map,
                         init_worker_tx,
                         worker_cq_tx,
@@ -207,6 +305,7 @@ impl Worker {
                     rdma_worker_thread::<VerbsDomain, 2>(
                         verbs_domain_list,
                         self.pin_worker_cpu,
+                        polling_mode,
                         imm_count_map,
                         init_worker_tx,
                         worker_cq_tx,
@@ -227,7 +326,9 @@ impl Worker {
         let uvm_thread_builder =
             std::thread::Builder::new().name("tx_engine_uvm_worker".to_string());
         let uvm_handle = uvm_thread_builder
-            .spawn(move || uvm_worker_thread(self.pin_uvm_cpu, init_uvm_tx, cq_tx))
+            .spawn(move || {
+                uvm_worker_thread(self.pin_uvm_cpu, polling_mode, init_uvm_tx, cq_tx)
+            })
             .map_err(|_| FabricLibError::Custom("Failed to spawn UVM worker thread"))?;
 
         Ok(InitializingWorker {
@@ -342,6 +443,7 @@ impl UvmWatcherContext {
 fn rdma_worker_thread<D: RdmaDomain, const N: usize>(
     domain_list: Vec<D::Info>,
     maybe_pin_cpu: Option<u16>,
+    polling_mode: PollingMode,
     imm_count_map: Arc<ImmCountMap>,
     init_tx: oneshot::Sender<Result<InitializedWorker>>,
     cq_tx: crossbeam_channel::Sender<TransferCompletionEntry>,
@@ -405,41 +507,47 @@ fn rdma_worker_thread<D: RdmaDomain, const N: usize>(
     }
 
     // Main loop
+    let mut idle_poller = IdlePoller::new(polling_mode);
     while !stop_signal.load(SeqCst) {
-        std::hint::spin_loop();
-        let ret = worker_step(&mut group, &call_rx, &cmd_rx, &cq_tx);
-        if ret.is_err() {
-            panic!("fabric-lib internal error: Worker step failed");
-        }
+        let active =
+            worker_step(&mut group, &call_rx, &cmd_rx, &cq_tx).unwrap_or_else(|_| {
+                panic!("fabric-lib internal error: Worker step failed")
+            });
+        idle_poller.wait(active);
     }
 }
 
 fn worker_step<D: RdmaDomain, const N: usize>(
     group: &mut DomainGroup<D, N>,
     call_rx: &crossbeam_channel::Receiver<WorkerCall>,
-    cmd_rx: &crossbeam_channel::Receiver<Box<WorkerCommand>>,
+    cmd_rx: &crossbeam_channel::Receiver<WorkerCommand>,
     cq_tx: &crossbeam_channel::Sender<TransferCompletionEntry>,
-) -> std::result::Result<(), ()> {
+) -> std::result::Result<bool, ()> {
+    let mut active = false;
+
     // Process function call
     match call_rx.try_recv() {
-        Ok(call) => match call {
-            WorkerCall::RegisterMRLocal { region, ret } => {
-                let result = group.register_mr_local(&region);
-                ret.send(result).map_err(|_| ())?;
+        Ok(call) => {
+            active = true;
+            match call {
+                WorkerCall::RegisterMRLocal { region, ret } => {
+                    let result = group.register_mr_local(&region);
+                    ret.send(result).map_err(|_| ())?;
+                }
+                WorkerCall::RegisterMRAllowRemote { region, ret } => {
+                    let result = group.register_mr_allow_remote(&region);
+                    ret.send(result).map_err(|_| ())?;
+                }
+                WorkerCall::UnregisterMR { ptr, ret } => {
+                    group.unregister_mr(ptr);
+                    ret.send(()).map_err(|_| ())?;
+                }
+                WorkerCall::AddPeerGroup { addrs, ret } => {
+                    let result = group.add_peer_group(addrs);
+                    ret.send(result).map_err(|_| ())?;
+                }
             }
-            WorkerCall::RegisterMRAllowRemote { region, ret } => {
-                let result = group.register_mr_allow_remote(&region);
-                ret.send(result).map_err(|_| ())?;
-            }
-            WorkerCall::UnregisterMR { ptr, ret } => {
-                group.unregister_mr(ptr);
-                ret.send(()).map_err(|_| ())?;
-            }
-            WorkerCall::AddPeerGroup { addrs, ret } => {
-                let result = group.add_peer_group(addrs);
-                ret.send(result).map_err(|_| ())?;
-            }
-        },
+        }
         Err(TryRecvError::Disconnected) => {
             // Channel disconnected, exit the thread
             return Err(());
@@ -449,9 +557,18 @@ fn worker_step<D: RdmaDomain, const N: usize>(
         }
     }
 
-    // Process worker command
-    match cmd_rx.try_recv() {
-        Ok(cmd) => match *cmd {
+    // Drain a bounded batch before polling the CQ. Concurrent callers commonly publish a whole
+    // window together; processing only one command per poll inserts an empty CQ lookup between
+    // every post and stretches both the initial fill and steady-state refill of the send queue.
+    // Keep a bound so receive completions cannot be starved by a continuously full command queue.
+    for _ in 0..64 {
+        let cmd = match cmd_rx.try_recv() {
+            Ok(cmd) => cmd,
+            Err(TryRecvError::Disconnected) => return Err(()),
+            Err(TryRecvError::Empty) => break,
+        };
+        active = true;
+        match cmd {
             WorkerCommand::SubmitTransfer { transfer_id, request, tx_counter } => {
                 let result =
                     group.submit_transfer_request(transfer_id, request, tx_counter);
@@ -460,8 +577,16 @@ fn worker_step<D: RdmaDomain, const N: usize>(
                     cq_tx.send(comp).map_err(|_| ())?;
                 }
             }
-            WorkerCommand::SubmitSend { transfer_id, mr, ptr, len, addr } => {
-                let result = group.submit_send(transfer_id, mr, ptr, len, addr);
+            WorkerCommand::SubmitSend {
+                transfer_id,
+                mr,
+                ptr,
+                len,
+                addr,
+                coalescible,
+            } => {
+                let result =
+                    group.submit_send(transfer_id, mr, ptr, len, addr, coalescible);
                 if let Err(e) = result {
                     let comp = TransferCompletionEntry::Error(transfer_id, e);
                     cq_tx.send(comp).map_err(|_| ())?;
@@ -474,13 +599,6 @@ fn worker_step<D: RdmaDomain, const N: usize>(
                     cq_tx.send(comp).map_err(|_| ())?;
                 }
             }
-        },
-        Err(TryRecvError::Disconnected) => {
-            // Channel disconnected, exit the thread
-            return Err(());
-        }
-        Err(TryRecvError::Empty) => {
-            // No command, continue
         }
     }
 
@@ -489,12 +607,23 @@ fn worker_step<D: RdmaDomain, const N: usize>(
 
     // Send completions
     while let Some(comp) = group.get_completion() {
+        active = true;
         let tx_comp = match comp {
             DomainCompletionEntry::Recv { transfer_id, data_len } => {
                 TransferCompletionEntry::Recv { transfer_id, data_len }
             }
+            DomainCompletionEntry::Send(transfer_id)
+                if transfer_id.0 & REMOTE_CONFIRMED_OPERATION_BIT != 0 =>
+            {
+                continue;
+            }
             DomainCompletionEntry::Send(transfer_id) => {
                 TransferCompletionEntry::Send(transfer_id)
+            }
+            DomainCompletionEntry::Transfer(transfer_id)
+                if transfer_id.0 & REMOTE_CONFIRMED_OPERATION_BIT != 0 =>
+            {
+                continue;
             }
             DomainCompletionEntry::Transfer(transfer_id) => {
                 TransferCompletionEntry::Transfer(transfer_id)
@@ -511,11 +640,12 @@ fn worker_step<D: RdmaDomain, const N: usize>(
         };
         cq_tx.send(tx_comp).map_err(|_| ())?;
     }
-    Ok(())
+    Ok(active)
 }
 
 fn uvm_worker_thread(
     maybe_pin_cpu: Option<u16>,
+    polling_mode: PollingMode,
     init_tx: oneshot::Sender<Result<InitializedUvmWatcher>>,
     cq_tx: crossbeam_channel::Sender<TransferCompletionEntry>,
 ) {
@@ -544,12 +674,13 @@ fn uvm_worker_thread(
     }
 
     // Main loop
+    let mut idle_poller = IdlePoller::new(polling_mode);
     while !stop_signal.load(SeqCst) {
-        std::hint::spin_loop();
-        let ret = uwm_worker_step(&mut uvm_ctx, &call_rx, &cq_tx);
-        if ret.is_err() {
-            panic!("fabric-lib internal error: Worker step failed");
-        }
+        let active =
+            uwm_worker_step(&mut uvm_ctx, &call_rx, &cq_tx).unwrap_or_else(|_| {
+                panic!("fabric-lib internal error: Worker step failed")
+            });
+        idle_poller.wait(active);
     }
 }
 
@@ -557,21 +688,25 @@ fn uwm_worker_step(
     uvm_ctx: &mut Option<UvmWatcherContext>,
     call_rx: &crossbeam_channel::Receiver<UvmWatcherCall>,
     cq_tx: &crossbeam_channel::Sender<TransferCompletionEntry>,
-) -> std::result::Result<(), ()> {
+) -> std::result::Result<bool, ()> {
+    let mut active = false;
     match call_rx.try_recv() {
-        Ok(call) => match call {
-            UvmWatcherCall::AcquireUvmWatcher { ret } => {
-                let uvm_ctx = uvm_ctx.get_or_insert_with(UvmWatcherContext::new);
-                let result = uvm_ctx.acquire();
-                ret.send(result).map_err(|_| ())?;
-            }
-            UvmWatcherCall::ReleaseUvmWatcher { watcher, ret } => {
-                if let Some(uvm_ctx) = uvm_ctx {
-                    uvm_ctx.release(watcher);
+        Ok(call) => {
+            active = true;
+            match call {
+                UvmWatcherCall::AcquireUvmWatcher { ret } => {
+                    let uvm_ctx = uvm_ctx.get_or_insert_with(UvmWatcherContext::new);
+                    let result = uvm_ctx.acquire();
+                    ret.send(result).map_err(|_| ())?;
                 }
-                ret.send(()).map_err(|_| ())?;
+                UvmWatcherCall::ReleaseUvmWatcher { watcher, ret } => {
+                    if let Some(uvm_ctx) = uvm_ctx {
+                        uvm_ctx.release(watcher);
+                    }
+                    ret.send(()).map_err(|_| ())?;
+                }
             }
-        },
+        }
         Err(TryRecvError::Disconnected) => {
             // Channel disconnected, exit the thread
             return Err(());
@@ -587,6 +722,7 @@ fn uwm_worker_step(
             let value = *uvm_ctx.uvm_memory.get_mut(*slot);
             let old = uvm_ctx.last_values[*slot];
             if value != old {
+                active = true;
                 uvm_ctx.last_values[*slot] = value;
                 let id = uvm_ctx.slot_to_id(*slot);
                 let comp = TransferCompletionEntry::UvmWatch { id, old, new: value };
@@ -595,5 +731,37 @@ fn uwm_worker_step(
         }
     }
 
-    Ok(())
+    Ok(active)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IdlePoller, PollingMode};
+    use std::time::Duration;
+
+    #[test]
+    fn adaptive_poller_parks_only_after_idle_and_rearms_on_activity() {
+        let mut poller = IdlePoller::new(PollingMode::Adaptive {
+            spin_duration: Duration::ZERO,
+            idle_sleep: Duration::ZERO,
+        });
+        for _ in 0..IdlePoller::CLOCK_CHECK_INTERVAL {
+            poller.wait(false);
+        }
+        assert!(poller.sleeping);
+
+        poller.wait(true);
+        assert!(!poller.sleeping);
+        assert!(poller.idle_since.is_none());
+        assert_eq!(poller.idle_polls, 0);
+    }
+
+    #[test]
+    fn busy_poller_never_enters_the_sleeping_state() {
+        let mut poller = IdlePoller::new(PollingMode::Busy);
+        for _ in 0..IdlePoller::CLOCK_CHECK_INTERVAL * 2 {
+            poller.wait(false);
+        }
+        assert!(!poller.sleeping);
+    }
 }

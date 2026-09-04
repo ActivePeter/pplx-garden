@@ -1,6 +1,7 @@
 pub mod api;
 mod cuda_compat;
 mod domain_group;
+#[cfg(feature = "efa")]
 mod efa;
 mod error;
 mod fabric_engine;
@@ -22,6 +23,7 @@ mod worker;
 
 pub use cuda_compat::{CudaDeviceId, CudaHostMemory, Device, GdrFlag};
 pub use domain_group::DomainGroup;
+#[cfg(feature = "efa")]
 pub use efa::{EfaDomainInfo, get_efa_domains};
 pub use error::*;
 pub use fabric_engine::FabricEngine;
@@ -35,11 +37,12 @@ pub use provider_dispatch::DomainInfo;
 #[cfg(feature = "cuda")]
 pub use topo::{TopologyGroup, detect_topology};
 pub use transfer_engine::{
-    ImmCountCallback, TransferCallback, TransferEngine, UvmWatcherCallback,
+    ImmCountCallback, TransferCallback, TransferEngine, TransferResultCallback,
+    UvmWatcherCallback,
 };
 #[cfg(feature = "cuda")]
 pub use transfer_engine_builder::TransferEngineBuilder;
 pub use verbs::{VerbsDeviceInfo, VerbsDeviceList};
-pub use worker::{InitializingWorker, Worker, WorkerHandle};
+pub use worker::{InitializingWorker, PollingMode, Worker, WorkerHandle};
 
 pub use interface::MockTestTransferEngine;

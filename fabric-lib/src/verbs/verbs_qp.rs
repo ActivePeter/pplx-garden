@@ -1,6 +1,7 @@
 use std::ptr::NonNull;
 
 use crate::{
+    api::MAX_GATHER_SEGMENTS,
     error::{Result, VerbsError},
     verbs::verbs_address::{Gid, VerbsRCAddress, VerbsUDAddress},
 };
@@ -107,6 +108,7 @@ pub struct RCQueuePair {
     // TODO: state enum
     pub addr: VerbsRCAddress,
     pub qp: NonNull<ibv_qp>,
+    pub max_inline_data: u32,
 }
 
 impl RCQueuePair {
@@ -118,6 +120,7 @@ impl RCQueuePair {
         lid: u16,
         max_wr: u32,
         psn: u32,
+        requested_max_inline_data: u32,
     ) -> Result<Self> {
         let mut qp_init_attr = ibv_qp_init_attr {
             qp_type: IBV_QPT_RC,
@@ -127,16 +130,32 @@ impl RCQueuePair {
             srq: srq.as_ptr(),
             cap: ibv_qp_cap {
                 max_send_wr: max_wr,
-                max_send_sge: 1,
+                max_inline_data: requested_max_inline_data,
+                // Gather writes use a short protocol header plus an independently registered
+                // payload. Four SGEs leaves room for future metadata segments while remaining
+                // below the capability of the supported mlx5 devices.
+                max_send_sge: MAX_GATHER_SEGMENTS as u32,
                 ..Default::default()
             },
             ..Default::default()
         };
-        let qp =
-            NonNull::new(unsafe { ibv_create_qp(pd.as_ptr(), &raw mut qp_init_attr) })
-                .ok_or_else(|| VerbsError::with_last_os_error("ibv_create_qp"))?;
+        let mut qp =
+            NonNull::new(unsafe { ibv_create_qp(pd.as_ptr(), &raw mut qp_init_attr) });
+        // Inline capacity is a performance hint, not a compatibility requirement. Retry without
+        // it on providers that cannot satisfy the requested size.
+        if qp.is_none() && requested_max_inline_data != 0 {
+            qp_init_attr.cap.max_inline_data = 0;
+            qp = NonNull::new(unsafe {
+                ibv_create_qp(pd.as_ptr(), &raw mut qp_init_attr)
+            });
+        }
+        let qp = qp.ok_or_else(|| VerbsError::with_last_os_error("ibv_create_qp"))?;
         let qp_num = unsafe { (*qp.as_ptr()).qp_num };
-        Ok(RCQueuePair { addr: VerbsRCAddress { gid, lid, qp_num, psn }, qp })
+        Ok(RCQueuePair {
+            addr: VerbsRCAddress { gid, lid, qp_num, psn },
+            qp,
+            max_inline_data: qp_init_attr.cap.max_inline_data,
+        })
     }
 
     pub fn rc_reset_to_init(&self, port_num: u8, pkey_index: u16) -> Result<()> {

@@ -5,11 +5,12 @@ publish = false
 
 [features]
 default = ["cuda"]
-cuda = ["dep:cuda-lib"]
+cuda = ["dep:cuda-lib", "efa"]
+efa = ["dep:libfabric-sys"]
 tokio = ["dep:tokio", "tokio/sync", "tokio/rt-multi-thread"]
 
 [dependencies]
-libfabric-sys = { path = "./libfabric-sys" }
+libfabric-sys = { path = "./libfabric-sys", optional = true }
 libibverbs-sys = { path = "./libibverbs-sys" }
 
 cuda-lib = { workspace = true, optional = true }

@@ -5,7 +5,10 @@ use std::{
     ptr::NonNull,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering::SeqCst},
+        atomic::{
+            AtomicBool, AtomicUsize,
+            Ordering::{Relaxed, SeqCst},
+        },
     },
 };
 
@@ -32,6 +35,9 @@ pub struct FabricEngine {
     aggregated_link_speed: u64,
     nets_per_gpu: NonZeroU8,
     stop_signal: AtomicBool,
+    host_striped: bool,
+    host_submit_rr: AtomicUsize,
+    completion_rr: AtomicUsize,
     mr_device_map: DashMap<MemoryRegionHandle, Device>,
     imm_count_map: Arc<ImmCountMap>,
 }
@@ -42,6 +48,19 @@ struct WorkerContext {
 
 impl FabricEngine {
     pub fn new(workers: Vec<(u8, Worker)>) -> Result<Self> {
+        Self::new_inner(workers, false)
+    }
+
+    pub fn new_host_striped(workers: Vec<(u8, Worker)>) -> Result<Self> {
+        Self::new_inner(workers, true)
+    }
+
+    fn new_inner(workers: Vec<(u8, Worker)>, host_striped: bool) -> Result<Self> {
+        if workers.is_empty() {
+            return Err(FabricLibError::Custom(
+                "FabricEngine requires at least one worker",
+            ));
+        }
         let imm_count_map = Arc::new(ImmCountMap::default());
 
         let spawned_workers = workers
@@ -84,6 +103,9 @@ impl FabricEngine {
             aggregated_link_speed,
             nets_per_gpu,
             stop_signal: AtomicBool::new(false),
+            host_striped,
+            host_submit_rr: AtomicUsize::new(0),
+            completion_rr: AtomicUsize::new(0),
             mr_device_map: DashMap::new(),
             imm_count_map,
         })
@@ -91,6 +113,13 @@ impl FabricEngine {
 
     pub fn main_address(&self) -> DomainAddress {
         self.main_address.clone()
+    }
+
+    pub fn main_addresses(&self) -> Vec<DomainAddress> {
+        self.workers
+            .values()
+            .map(|context| context.worker.address_list[0].clone())
+            .collect()
     }
 
     pub fn num_groups(&self) -> usize {
@@ -109,23 +138,33 @@ impl FabricEngine {
         self.nets_per_gpu
     }
 
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
     pub fn register_memory_local(
         &self,
         ptr: NonNull<c_void>,
         len: usize,
         device: Device,
     ) -> Result<MemoryRegionHandle> {
-        let worker = self.get_worker(&device)?;
-        let region = MemoryRegion::new(ptr, len, device)?;
-        let (tx, rx) = oneshot::channel();
-        let cmd = WorkerCall::RegisterMRLocal { region, ret: tx };
-        worker
-            .worker
-            .worker_call_tx
-            .send(cmd)
-            .map_err(|_| FabricLibError::Custom("Worker is down"))?;
-        let handle =
-            rx.recv().map_err(|_| FabricLibError::Custom("Worker is down"))??;
+        let handle = if self.host_striped && device == Device::Host {
+            let mut handle = None;
+            for worker in self.workers.values() {
+                let registered = worker
+                    .register_memory_local(MemoryRegion::new(ptr, len, device)?)?;
+                if handle.is_some_and(|current| current != registered) {
+                    return Err(FabricLibError::Custom(
+                        "striped host workers returned inconsistent memory handles",
+                    ));
+                }
+                handle = Some(registered);
+            }
+            handle.expect("a FabricEngine always has a worker")
+        } else {
+            self.get_worker(&device)?
+                .register_memory_local(MemoryRegion::new(ptr, len, device)?)?
+        };
         self.mr_device_map.insert(handle, device);
         Ok(handle)
     }
@@ -136,31 +175,58 @@ impl FabricEngine {
         len: usize,
         device: Device,
     ) -> Result<(MemoryRegionHandle, MemoryRegionDescriptor)> {
-        let worker = self.get_worker(&device)?;
-        let (tx, rx) = oneshot::channel();
-        let region = MemoryRegion::new(ptr, len, device)?;
-        let cmd = WorkerCall::RegisterMRAllowRemote { region, ret: tx };
-        worker
-            .worker
-            .worker_call_tx
-            .send(cmd)
-            .map_err(|_| FabricLibError::Custom("Worker is down"))?;
-        let (handle, desc) =
-            rx.recv().map_err(|_| FabricLibError::Custom("Worker is down"))??;
+        let (handle, desc) = if self.host_striped && device == Device::Host {
+            let mut handle = None;
+            let mut address_keys = SmallVec::new();
+            for worker in self.workers.values() {
+                let (registered, descriptor) = worker.register_memory_allow_remote(
+                    MemoryRegion::new(ptr, len, device)?,
+                )?;
+                if handle.is_some_and(|current| current != registered) {
+                    return Err(FabricLibError::Custom(
+                        "striped host workers returned inconsistent memory handles",
+                    ));
+                }
+                if descriptor.ptr != ptr.as_ptr() as u64
+                    || descriptor.addr_rkey_list.len() != 1
+                {
+                    return Err(FabricLibError::Custom(
+                        "striped host workers require one domain per worker",
+                    ));
+                }
+                handle = Some(registered);
+                address_keys.extend(descriptor.addr_rkey_list);
+            }
+            (
+                handle.expect("a FabricEngine always has a worker"),
+                MemoryRegionDescriptor {
+                    ptr: ptr.as_ptr() as u64,
+                    addr_rkey_list: address_keys,
+                },
+            )
+        } else {
+            self.get_worker(&device)?
+                .register_memory_allow_remote(MemoryRegion::new(ptr, len, device)?)?
+        };
         self.mr_device_map.insert(handle, device);
         Ok((handle, desc))
     }
 
     pub fn unregister_memory(&self, ptr: NonNull<c_void>) -> Result<()> {
-        let worker = self.get_main_worker()?;
-        let (tx, rx) = oneshot::channel();
-        let cmd = WorkerCall::UnregisterMR { ptr, ret: tx };
-        worker
-            .worker
-            .worker_call_tx
-            .send(cmd)
-            .map_err(|_| FabricLibError::Custom("Worker is down"))?;
-        rx.recv().map_err(|_| FabricLibError::Custom("Worker is down"))?;
+        let handle = MemoryRegionHandle::new(ptr);
+        let device = self
+            .mr_device_map
+            .get(&handle)
+            .map(|entry| *entry)
+            .ok_or(FabricLibError::Custom("Invalid memory region"))?;
+        if self.host_striped && device == Device::Host {
+            for worker in self.workers.values() {
+                worker.unregister_memory(ptr)?;
+            }
+        } else {
+            self.get_worker(&device)?.unregister_memory(ptr)?;
+        }
+        self.mr_device_map.remove(&handle);
         Ok(())
     }
 
@@ -235,10 +301,25 @@ impl FabricEngine {
         mr: MemoryRegionHandle,
         ptr: NonNull<c_void>,
         len: usize,
+        coalescible: bool,
     ) -> Result<()> {
-        let worker = self.get_main_worker()?;
-        let cmd = WorkerCommand::SubmitSend { transfer_id, addr, mr, ptr, len };
-        worker.send_command(Box::new(cmd))?;
+        self.submit_send_on(0, transfer_id, addr, mr, ptr, len, coalescible)
+    }
+
+    pub fn submit_send_on(
+        &self,
+        worker_index: usize,
+        transfer_id: TransferId,
+        addr: DomainAddress,
+        mr: MemoryRegionHandle,
+        ptr: NonNull<c_void>,
+        len: usize,
+        coalescible: bool,
+    ) -> Result<()> {
+        let worker = self.get_worker_by_index(worker_index)?;
+        let cmd =
+            WorkerCommand::SubmitSend { transfer_id, addr, mr, ptr, len, coalescible };
+        worker.send_command(cmd)?;
         Ok(())
     }
 
@@ -249,44 +330,90 @@ impl FabricEngine {
         ptr: NonNull<c_void>,
         len: usize,
     ) -> Result<()> {
-        let worker = self.get_main_worker()?;
-        worker.send_command(Box::new(WorkerCommand::SubmitRecv {
-            transfer_id,
-            mr,
-            ptr,
-            len,
-        }))?;
+        self.submit_recv_on(0, transfer_id, mr, ptr, len)
+    }
+
+    pub fn submit_recv_on(
+        &self,
+        worker_index: usize,
+        transfer_id: TransferId,
+        mr: MemoryRegionHandle,
+        ptr: NonNull<c_void>,
+        len: usize,
+    ) -> Result<()> {
+        let worker = self.get_worker_by_index(worker_index)?;
+        worker.send_command(WorkerCommand::SubmitRecv { transfer_id, mr, ptr, len })?;
         Ok(())
     }
 
     pub fn submit_transfer(
         &self,
         transfer_id: TransferId,
-        request: TransferRequest,
+        mut request: TransferRequest,
         tx_counter: Option<TransferCounter>,
     ) -> Result<()> {
-        let worker = match &request {
-            TransferRequest::Imm(_) => self.get_main_worker()?,
-            TransferRequest::Barrier(_) => self.get_main_worker()?,
-            TransferRequest::Single(req) => self.get_worker_by_mr(req.src_mr)?,
-            TransferRequest::Paged(req) => self.get_worker_by_mr(req.src_mr)?,
-            TransferRequest::Scatter(req) => self.get_worker_by_mr(req.src_mr)?,
+        let source_device = match &request {
+            TransferRequest::Imm(_) | TransferRequest::Barrier(_) => None,
+            TransferRequest::Single(req) => Some(self.device_for_mr(req.src_mr)?),
+            TransferRequest::Gather(req) => {
+                let first = req.segments.first().ok_or(FabricLibError::Custom(
+                    "GatherTransferRequest must contain at least one segment",
+                ))?;
+                let device = self.device_for_mr(first.src_mr)?;
+                for segment in req.segments.iter().skip(1) {
+                    if self.device_for_mr(segment.src_mr)? != device {
+                        return Err(FabricLibError::Custom(
+                            "GatherTransferRequest segments must belong to one device",
+                        ));
+                    }
+                }
+                Some(device)
+            }
+            TransferRequest::Paged(req) => Some(self.device_for_mr(req.src_mr)?),
+            TransferRequest::Scatter(req) => Some(self.device_for_mr(req.src_mr)?),
         };
-        worker.send_command(Box::new(WorkerCommand::SubmitTransfer {
+        let worker = if self.host_striped
+            && source_device.is_none_or(|device| device == Device::Host)
+        {
+            let index = if source_device.is_some() {
+                self.host_submit_rr.fetch_add(1, Relaxed) % self.workers.len()
+            } else {
+                0
+            };
+            narrow_host_transfer_request(&mut request, index, self.workers.len())?;
+            self.workers
+                .values()
+                .nth(index)
+                .expect("validated striped host worker index")
+        } else {
+            match source_device {
+                Some(device) => self.get_worker(&device)?,
+                None => self.get_main_worker()?,
+            }
+        };
+        worker.send_command(WorkerCommand::SubmitTransfer {
             transfer_id,
             request,
             tx_counter,
-        }))
+        })
     }
 
     pub fn poll_transfer_completion(&self) -> Option<TransferCompletionEntry> {
-        for (_, ctx) in self.workers.iter() {
+        let start = self.completion_rr.fetch_add(1, Relaxed) % self.workers.len();
+        for ctx in self.workers.values().cycle().skip(start).take(self.workers.len()) {
             if let Ok(completion) = ctx.worker.cq_rx.try_recv() {
                 return Some(completion);
             }
         }
 
         None
+    }
+
+    pub fn poll_worker_completion(
+        &self,
+        worker_index: usize,
+    ) -> Option<TransferCompletionEntry> {
+        self.workers.values().nth(worker_index)?.worker.cq_rx.try_recv().ok()
     }
 
     pub fn stop(&self) {
@@ -300,12 +427,11 @@ impl FabricEngine {
         self.stop_signal.load(SeqCst)
     }
 
-    fn get_worker_by_mr(&self, mr: MemoryRegionHandle) -> Result<&WorkerContext> {
-        if let Some(device) = self.mr_device_map.get(&mr) {
-            self.get_worker(device.value())
-        } else {
-            Err(FabricLibError::Custom("Invalid memory region"))
-        }
+    fn device_for_mr(&self, mr: MemoryRegionHandle) -> Result<Device> {
+        self.mr_device_map
+            .get(&mr)
+            .map(|device| *device)
+            .ok_or(FabricLibError::Custom("Invalid memory region"))
     }
 
     fn get_worker(&self, device: &Device) -> Result<&WorkerContext> {
@@ -321,6 +447,62 @@ impl FabricEngine {
     fn get_main_worker(&self) -> Result<&WorkerContext> {
         Ok(self.workers.first_key_value().unwrap().1)
     }
+
+    fn get_worker_by_index(&self, worker_index: usize) -> Result<&WorkerContext> {
+        self.workers
+            .values()
+            .nth(worker_index)
+            .ok_or(FabricLibError::Custom("Worker index is out of range"))
+    }
+}
+
+fn narrow_host_descriptor(
+    descriptor: &mut MemoryRegionDescriptor,
+    worker_index: usize,
+    worker_count: usize,
+) -> Result<()> {
+    if descriptor.addr_rkey_list.len() != worker_count {
+        return Err(FabricLibError::Custom(
+            "Remote memory descriptor does not match striped host worker count",
+        ));
+    }
+    let selected = descriptor.addr_rkey_list[worker_index].clone();
+    descriptor.addr_rkey_list.clear();
+    descriptor.addr_rkey_list.push(selected);
+    Ok(())
+}
+
+fn narrow_host_transfer_request(
+    request: &mut TransferRequest,
+    worker_index: usize,
+    worker_count: usize,
+) -> Result<()> {
+    match request {
+        TransferRequest::Imm(request) => {
+            narrow_host_descriptor(&mut request.dst_mr, worker_index, worker_count)
+        }
+        TransferRequest::Barrier(request) => {
+            for descriptor in &mut request.dst_mrs {
+                narrow_host_descriptor(descriptor, worker_index, worker_count)?;
+            }
+            Ok(())
+        }
+        TransferRequest::Single(request) => {
+            narrow_host_descriptor(&mut request.dst_mr, worker_index, worker_count)
+        }
+        TransferRequest::Gather(request) => {
+            narrow_host_descriptor(&mut request.dst_mr, worker_index, worker_count)
+        }
+        TransferRequest::Paged(request) => {
+            narrow_host_descriptor(&mut request.dst_mr, worker_index, worker_count)
+        }
+        TransferRequest::Scatter(request) => {
+            for target in Arc::make_mut(&mut request.dsts) {
+                narrow_host_descriptor(&mut target.dst_mr, worker_index, worker_count)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 impl Drop for FabricEngine {
@@ -333,7 +515,40 @@ impl Drop for FabricEngine {
 }
 
 impl WorkerContext {
-    pub fn send_command(&self, cmd: Box<WorkerCommand>) -> Result<()> {
+    fn register_memory_local(
+        &self,
+        region: MemoryRegion,
+    ) -> Result<MemoryRegionHandle> {
+        let (tx, rx) = oneshot::channel();
+        self.worker
+            .worker_call_tx
+            .send(WorkerCall::RegisterMRLocal { region, ret: tx })
+            .map_err(|_| FabricLibError::Custom("Worker is down"))?;
+        rx.recv().map_err(|_| FabricLibError::Custom("Worker is down"))?
+    }
+
+    fn register_memory_allow_remote(
+        &self,
+        region: MemoryRegion,
+    ) -> Result<(MemoryRegionHandle, MemoryRegionDescriptor)> {
+        let (tx, rx) = oneshot::channel();
+        self.worker
+            .worker_call_tx
+            .send(WorkerCall::RegisterMRAllowRemote { region, ret: tx })
+            .map_err(|_| FabricLibError::Custom("Worker is down"))?;
+        rx.recv().map_err(|_| FabricLibError::Custom("Worker is down"))?
+    }
+
+    fn unregister_memory(&self, ptr: NonNull<c_void>) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.worker
+            .worker_call_tx
+            .send(WorkerCall::UnregisterMR { ptr, ret: tx })
+            .map_err(|_| FabricLibError::Custom("Worker is down"))?;
+        rx.recv().map_err(|_| FabricLibError::Custom("Worker is down"))
+    }
+
+    pub fn send_command(&self, cmd: WorkerCommand) -> Result<()> {
         self.worker
             .cmd_tx
             .send(cmd)

@@ -7,14 +7,15 @@ use std::{
 };
 
 use libibverbs_sys::{
-    IBV_SEND_SIGNALED, IBV_WR_RDMA_WRITE, IBV_WR_RDMA_WRITE_WITH_IMM, IBV_WR_SEND,
-    ibv_qp, ibv_recv_wr, ibv_send_wr, ibv_sge,
+    IBV_SEND_INLINE, IBV_SEND_SIGNALED, IBV_WR_RDMA_WRITE, IBV_WR_RDMA_WRITE_WITH_IMM,
+    IBV_WR_SEND, ibv_qp, ibv_recv_wr, ibv_send_wr, ibv_sge,
 };
 
 use crate::{
-    api::ScatterTarget,
+    api::{MAX_GATHER_SEGMENTS, ScatterTarget},
     rdma_op::{
-        ImmWriteOp, PagedWriteOp, RecvOp, ScatterGroupWriteOp, SendOp, SingleWriteOp,
+        GatherWriteOp, ImmWriteOp, PagedWriteOp, RecvOp, ScatterGroupWriteOp, SendOp,
+        SingleWriteOp,
     },
 };
 
@@ -23,7 +24,8 @@ use crate::{
 pub const WR_CHAIN_LEN: usize = 4;
 
 pub type WrChainBuffer =
-    [(MaybeUninit<ibv_send_wr>, MaybeUninit<ibv_sge>); WR_CHAIN_LEN];
+    [(MaybeUninit<ibv_send_wr>, [MaybeUninit<ibv_sge>; MAX_GATHER_SEGMENTS]);
+        WR_CHAIN_LEN];
 
 pub struct SingleWriteOpIter {
     rma_qp: NonNull<ibv_qp>,
@@ -39,8 +41,8 @@ impl SingleWriteOpIter {
         context: *mut c_void,
     ) -> Self {
         let buf = unsafe { wr_chain_buffer.as_mut() };
-        let (wr, sge) = &mut buf[0];
-        let sge = sge.write(ibv_sge {
+        let (wr, sges) = &mut buf[0];
+        let sge = sges[0].write(ibv_sge {
             addr: unsafe { op.src_ptr.as_ptr().byte_add(op.src_offset as usize) }
                 as u64,
             length: op.length as u32,
@@ -99,6 +101,61 @@ impl SingleWriteOpIter {
     }
 }
 
+pub struct GatherWriteOpIter {
+    rma_qp: NonNull<ibv_qp>,
+    wr_chain_buffer: NonNull<WrChainBuffer>,
+    done: bool,
+}
+
+impl GatherWriteOpIter {
+    pub fn new(
+        op: GatherWriteOp,
+        rma_qp: NonNull<ibv_qp>,
+        mut wr_chain_buffer: NonNull<WrChainBuffer>,
+        context: *mut c_void,
+    ) -> Self {
+        assert!(!op.sources.is_empty());
+        let buf = unsafe { wr_chain_buffer.as_mut() };
+        let (wr, sges) = &mut buf[0];
+        for (slot, source) in sges.iter_mut().zip(op.sources.iter()) {
+            slot.write(ibv_sge {
+                addr: unsafe {
+                    source.src_ptr.as_ptr().byte_add(source.src_offset as usize)
+                } as u64,
+                length: source.length as u32,
+                lkey: source.src_desc.0 as u32,
+            });
+        }
+        let (opcode, imm) = opcode_imm(op.imm_data);
+        let wr = wr.write(ibv_send_wr {
+            wr_id: context as u64,
+            next: null_mut(),
+            sg_list: sges.as_mut_ptr().cast(),
+            num_sge: op.sources.len() as i32,
+            opcode,
+            send_flags: IBV_SEND_SIGNALED,
+            ..Default::default()
+        });
+        wr.__bindgen_anon_1.imm_data = imm;
+        wr.wr.rdma.remote_addr = op.dst_ptr + op.dst_offset;
+        wr.wr.rdma.rkey = op.dst_rkey.0 as u32;
+        Self { rma_qp, wr_chain_buffer, done: false }
+    }
+
+    pub fn peek(&self) -> (*mut ibv_qp, *mut ibv_send_wr, usize) {
+        if self.done {
+            (self.rma_qp.as_ptr(), null_mut(), 0)
+        } else {
+            let buf = unsafe { &mut *self.wr_chain_buffer.as_ptr() };
+            (self.rma_qp.as_ptr(), buf[0].0.as_mut_ptr(), 1)
+        }
+    }
+
+    pub fn mark_done(&mut self) {
+        self.done = true;
+    }
+}
+
 pub struct PagedWriteOpIter {
     rma_qp: NonNull<ibv_qp>,
     // Buffer
@@ -135,8 +192,8 @@ impl PagedWriteOpIter {
         let chain_len =
             std::cmp::min(op.page_indices_end - op.page_indices_beg, WR_CHAIN_LEN);
         let buf = unsafe { wr_chain_buffer.as_mut() };
-        for (wr, sge) in buf.iter_mut().take(chain_len) {
-            let sge = sge.write(ibv_sge {
+        for (wr, sges) in buf.iter_mut().take(chain_len) {
+            let sge = sges[0].write(ibv_sge {
                 addr: 0,
                 length: op.length as u32,
                 lkey: op.src_desc.0 as u32,
@@ -202,9 +259,9 @@ impl PagedWriteOpIter {
         let buf = unsafe { self.wr_chain_buffer.as_mut() };
         let (prev_wr, _) = &mut buf[(self.i_wr_tail + WR_CHAIN_LEN - 1) % WR_CHAIN_LEN];
         let prev_wr = unsafe { &mut *prev_wr.as_mut_ptr() };
-        let (wr, sge) = &mut buf[self.i_wr_tail];
+        let (wr, sges) = &mut buf[self.i_wr_tail];
         let wr = unsafe { wr.assume_init_mut() };
-        let sge = unsafe { sge.assume_init_mut() };
+        let sge = unsafe { sges[0].assume_init_mut() };
 
         // Update WR next pointer
         prev_wr.next = wr;
@@ -253,8 +310,9 @@ impl ScatterWriteOpIter {
         // Prepare WR template
         let (opcode, imm) = opcode_imm(op.imm_data);
         let buf = unsafe { wr_chain_buffer.as_mut() };
-        let (wr, sge) = &mut buf[0];
-        let sge = sge.write(ibv_sge { addr: 0, length: 0, lkey: op.src_desc.0 as u32 });
+        let (wr, sges) = &mut buf[0];
+        let sge =
+            sges[0].write(ibv_sge { addr: 0, length: 0, lkey: op.src_desc.0 as u32 });
         let wr = wr.write(ibv_send_wr {
             wr_id: context as u64,
             next: null_mut(),
@@ -306,9 +364,9 @@ impl ScatterWriteOpIter {
 
     fn fill_wr(&mut self) {
         let buf = unsafe { self.wr_chain_buffer.as_mut() };
-        let (wr, sge) = &mut buf[0];
+        let (wr, sges) = &mut buf[0];
         let wr = unsafe { wr.assume_init_mut() };
-        let sge = unsafe { sge.assume_init_mut() };
+        let sge = unsafe { sges[0].assume_init_mut() };
 
         // Update output buffers
         let dst = &self.dsts[self.i_dst];
@@ -333,6 +391,7 @@ fn opcode_imm(imm_data: Option<u32>) -> (u32, u32) {
 
 pub enum WriteOpIter {
     Single(SingleWriteOpIter),
+    Gather(GatherWriteOpIter),
     Paged(PagedWriteOpIter),
     Scatter(ScatterWriteOpIter),
 }
@@ -341,6 +400,7 @@ impl WriteOpIter {
     pub fn total_ops(&self) -> usize {
         match self {
             WriteOpIter::Single(_) => 1,
+            WriteOpIter::Gather(_) => 1,
             WriteOpIter::Paged(iter) => iter.total_ops(),
             WriteOpIter::Scatter(iter) => iter.total_ops(),
         }
@@ -349,14 +409,22 @@ impl WriteOpIter {
     pub fn peek(&self) -> (*mut ibv_qp, *mut ibv_send_wr, usize) {
         match self {
             WriteOpIter::Single(iter) => iter.peek(),
+            WriteOpIter::Gather(iter) => iter.peek(),
             WriteOpIter::Paged(iter) => iter.peek(),
             WriteOpIter::Scatter(iter) => iter.peek(),
         }
     }
 
     pub fn advance(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
         match self {
             WriteOpIter::Single(iter) => {
+                assert!(n == 1);
+                iter.mark_done();
+            }
+            WriteOpIter::Gather(iter) => {
                 assert!(n == 1);
                 iter.mark_done();
             }
@@ -369,25 +437,41 @@ impl WriteOpIter {
     }
 }
 
-pub fn fill_send_op(
-    op: &SendOp,
-    sge: &mut MaybeUninit<ibv_sge>,
+pub fn fill_send_ops<'a>(
+    ops: impl IntoIterator<Item = &'a SendOp>,
+    sges: &mut [MaybeUninit<ibv_sge>],
     wr: &mut MaybeUninit<ibv_send_wr>,
     context: *mut c_void,
+    max_inline_data: u32,
 ) {
-    unsafe {
-        *sge.as_mut_ptr() = ibv_sge {
+    let mut count = 0_usize;
+    let mut total_len = 0_usize;
+    for (op, sge) in ops.into_iter().zip(sges.iter_mut()) {
+        assert!(op.len <= u32::MAX as usize, "SEND segment exceeds verbs SGE length");
+        total_len =
+            total_len.checked_add(op.len).expect("coalesced SEND length overflow");
+        sge.write(ibv_sge {
             addr: op.ptr.as_ptr() as u64,
             length: op.len as u32,
             lkey: op.desc.0 as u32,
-        };
+        });
+        count += 1;
+    }
+    assert_eq!(count, sges.len(), "SEND operation and SGE counts differ");
+    assert!(count > 0, "SEND requires at least one SGE");
+    unsafe {
         *wr.as_mut_ptr() = ibv_send_wr {
             wr_id: context as u64,
             next: null_mut(),
-            sg_list: sge.as_mut_ptr(),
-            num_sge: 1,
+            sg_list: sges.as_mut_ptr().cast::<ibv_sge>(),
+            num_sge: count as i32,
             opcode: IBV_WR_SEND,
-            send_flags: IBV_SEND_SIGNALED,
+            send_flags: IBV_SEND_SIGNALED
+                | if total_len <= max_inline_data as usize {
+                    IBV_SEND_INLINE
+                } else {
+                    0
+                },
             ..Default::default()
         };
     }

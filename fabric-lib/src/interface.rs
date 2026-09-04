@@ -40,6 +40,7 @@ pub struct SendBuffer {
     pub(crate) ptr: NonNull<c_void>,
     pub(crate) len: usize,
     pub(crate) mr_handle: MemoryRegionHandle,
+    pub(crate) coalescible: bool,
 }
 
 unsafe impl Send for SendBuffer {}
@@ -51,7 +52,16 @@ impl SendBuffer {
         len: usize,
         mr_handle: MemoryRegionHandle,
     ) -> Self {
-        Self { ptr, len, mr_handle }
+        Self { ptr, len, mr_handle, coalescible: false }
+    }
+
+    /// Marks a self-framed buffer as safe to concatenate with adjacent SENDs to the same peer.
+    ///
+    /// The receiver observes the concatenated bytes as one message, so callers must only enable
+    /// this when their wire format can split multiple consecutive frames unambiguously.
+    pub fn with_coalescing(mut self) -> Self {
+        self.coalescible = true;
+        self
     }
 }
 pub type CallbackResult = std::result::Result<(), String>;

@@ -240,6 +240,7 @@ fn build_engine(args: &[String]) -> anyhow::Result<(Vec<u8>, FabricEngine)> {
             domain_list,
             pin_worker_cpu: Some(worker_cpu),
             pin_uvm_cpu: Some(uvm_cpu),
+            polling_mode: fabric_lib::PollingMode::Busy,
         };
         workers.push((cuda_device, worker));
     }

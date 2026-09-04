@@ -27,8 +27,8 @@ use crate::{
         efa_devinfo::EfaDomainInfo,
         efa_mr::EfaMemDesc,
         efa_rdma_op::{
-            PagedWriteOpIter, RmaBuffer, ScatterWriteOpIter, SingleWriteOpIter,
-            WriteOpIter, fill_recv_op, fill_send_op,
+            GatherWriteOpIter, PagedWriteOpIter, RmaBuffer, ScatterWriteOpIter,
+            SingleWriteOpIter, WriteOpIter, fill_recv_op, fill_send_op,
         },
     },
     error::{FabricLibError, LibfabricError, Result},
@@ -815,6 +815,9 @@ impl RdmaDomain for EfaDomain {
                 msg_buf,
                 rawctx,
             )),
+            WriteOp::Gather(op) => {
+                WriteOpIter::Gather(GatherWriteOpIter::new(op, dest_fi_addr, rawctx))
+            }
             WriteOp::Imm(op) => WriteOpIter::Single(SingleWriteOpIter::new_imm(
                 op,
                 dest_fi_addr,
