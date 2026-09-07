@@ -1,7 +1,7 @@
 use std::{ffi::c_void, ptr::NonNull, sync::Arc};
 
 use crate::{
-    api::{DomainAddress, MemoryRegionRemoteKey, ScatterTarget},
+    api::{DomainAddress, MemoryRegionRemoteKey, ScatterTarget, SmallVec},
     mr::MemoryRegionLocalDescriptor,
 };
 
@@ -14,6 +14,22 @@ pub struct SingleWriteOp {
     pub dst_ptr: u64,
     pub dst_rkey: MemoryRegionRemoteKey,
     pub dst_offset: u64,
+}
+
+pub struct GatherSource {
+    pub src_ptr: NonNull<c_void>,
+    pub src_desc: MemoryRegionLocalDescriptor,
+    pub src_offset: u64,
+    pub length: u64,
+}
+
+pub struct GatherWriteOp {
+    pub sources: SmallVec<GatherSource>,
+    pub imm_data: Option<u32>,
+    pub dst_ptr: u64,
+    pub dst_rkey: MemoryRegionRemoteKey,
+    pub dst_offset: u64,
+    pub length: u64,
 }
 
 pub struct ImmWriteOp {
@@ -41,6 +57,8 @@ pub struct PagedWriteOp {
 
 pub enum WriteOp {
     Single(SingleWriteOp),
+    Gather(GatherWriteOp),
+    Batch { qp_lane: usize, writes: Vec<GatherWriteOp> },
     Imm(ImmWriteOp),
     Paged(PagedWriteOp),
 }
@@ -81,6 +99,9 @@ pub struct SendOp {
     pub ptr: NonNull<c_void>,
     pub len: usize,
     pub desc: MemoryRegionLocalDescriptor,
+    /// The payload contains a complete self-delimiting frame and may be concatenated with
+    /// adjacent coalescible SENDs for the same destination.
+    pub coalescible: bool,
 }
 
 pub struct RecvOp {

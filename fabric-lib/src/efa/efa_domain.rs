@@ -9,12 +9,15 @@ use std::{
 
 use bytes::Bytes;
 use libfabric_sys::{
-    FI_ADDR_UNSPEC, FI_CQ_FORMAT_DATA, FI_EAGAIN, FI_EAVAIL, FI_ENABLE, FI_HMEM_CUDA,
-    FI_MR_DMABUF, FI_OPT_CUDA_API_PERMITTED, FI_OPT_ENDPOINT,
-    FI_OPT_SHARED_MEMORY_PERMITTED, FI_READ, FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE,
-    FI_SEND, FI_WRITE, fi_addr_t, fi_av_attr, fi_close, fi_cq_attr, fi_cq_data_entry,
-    fi_cq_err_entry, fi_fabric, fi_mr_attr, fi_mr_dmabuf, fid_av, fid_cq, fid_domain,
-    fid_ep, fid_fabric, fid_mr, iovec,
+    FI_ADDR_UNSPEC, FI_CQ_FORMAT_DATA, FI_EAGAIN, FI_EAVAIL, FI_ENABLE, FI_READ,
+    FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE, FI_SEND, FI_WRITE, fi_addr_t, fi_av_attr,
+    fi_close, fi_cq_attr, fi_cq_data_entry, fi_cq_err_entry, fi_fabric, fid_av, fid_cq,
+    fid_domain, fid_ep, fid_fabric, fid_mr,
+};
+#[cfg(feature = "cuda")]
+use libfabric_sys::{
+    FI_HMEM_CUDA, FI_MR_DMABUF, FI_OPT_CUDA_API_PERMITTED, FI_OPT_ENDPOINT,
+    FI_OPT_SHARED_MEMORY_PERMITTED, fi_mr_attr, fi_mr_dmabuf, iovec,
 };
 use tracing::{debug, error, warn};
 
@@ -24,8 +27,8 @@ use crate::{
         efa_devinfo::EfaDomainInfo,
         efa_mr::EfaMemDesc,
         efa_rdma_op::{
-            PagedWriteOpIter, RmaBuffer, ScatterWriteOpIter, SingleWriteOpIter,
-            WriteOpIter, fill_recv_op, fill_send_op,
+            GatherWriteOpIter, PagedWriteOpIter, RmaBuffer, ScatterWriteOpIter,
+            SingleWriteOpIter, WriteOpIter, fill_recv_op, fill_send_op,
         },
     },
     error::{FabricLibError, LibfabricError, Result},
@@ -162,37 +165,39 @@ impl EfaDomain {
                 return Err(LibfabricError::new(ret, "fi_ep_bind av").into());
             }
 
-            // Disallow using shm and cuda p2p transfer.
-            // All data transfer should go through RDMA.
-            let optval = false;
-            let fi_setopt = (*(*ep.as_ptr()).ops).setopt.unwrap_unchecked();
-            let ret = fi_setopt(
-                ep_fid,
-                FI_OPT_ENDPOINT as i32,
-                FI_OPT_SHARED_MEMORY_PERMITTED as i32,
-                &optval as *const _ as *mut c_void,
-                std::mem::size_of_val(&optval),
-            );
-            if ret != 0 {
-                return Err(LibfabricError::new(
-                    ret,
-                    "fi_setopt FI_OPT_SHARED_MEMORY_PERMITTED false",
-                )
-                .into());
-            }
-            let ret = fi_setopt(
-                ep_fid,
-                FI_OPT_ENDPOINT as i32,
-                FI_OPT_CUDA_API_PERMITTED as i32,
-                &optval as *const _ as *mut c_void,
-                std::mem::size_of_val(&optval),
-            );
-            if ret != 0 {
-                return Err(LibfabricError::new(
-                    ret,
-                    "fi_setopt FI_OPT_CUDA_API_PERMITTED false",
-                )
-                .into());
+            #[cfg(feature = "cuda")]
+            {
+                // Disallow using shm and cuda p2p transfer. All data goes through RDMA.
+                let optval = false;
+                let fi_setopt = (*(*ep.as_ptr()).ops).setopt.unwrap_unchecked();
+                let ret = fi_setopt(
+                    ep_fid,
+                    FI_OPT_ENDPOINT as i32,
+                    FI_OPT_SHARED_MEMORY_PERMITTED as i32,
+                    &optval as *const _ as *mut c_void,
+                    std::mem::size_of_val(&optval),
+                );
+                if ret != 0 {
+                    return Err(LibfabricError::new(
+                        ret,
+                        "fi_setopt FI_OPT_SHARED_MEMORY_PERMITTED false",
+                    )
+                    .into());
+                }
+                let ret = fi_setopt(
+                    ep_fid,
+                    FI_OPT_ENDPOINT as i32,
+                    FI_OPT_CUDA_API_PERMITTED as i32,
+                    &optval as *const _ as *mut c_void,
+                    std::mem::size_of_val(&optval),
+                );
+                if ret != 0 {
+                    return Err(LibfabricError::new(
+                        ret,
+                        "fi_setopt FI_OPT_CUDA_API_PERMITTED false",
+                    )
+                    .into());
+                }
             }
 
             // Enable endpoint
@@ -289,43 +294,73 @@ impl EfaDomain {
             access |= (FI_REMOTE_WRITE | FI_REMOTE_READ) as u64;
         }
 
-        let mut mr = null_mut();
-        let mut mr_attr = fi_mr_attr { iov_count: 1, access, ..Default::default() };
-
-        let iov = iovec { iov_base: region.ptr().as_ptr(), iov_len: region.len() };
-        let mut dmabuf = fi_mr_dmabuf {
-            len: region.len(),
-            base_addr: region.ptr().as_ptr(),
-            ..Default::default()
+        #[cfg(feature = "cuda")]
+        let (ret, mr) = {
+            let mut mr = null_mut();
+            let mut mr_attr = fi_mr_attr { iov_count: 1, access, ..Default::default() };
+            let iov = iovec { iov_base: region.ptr().as_ptr(), iov_len: region.len() };
+            let mut dmabuf = fi_mr_dmabuf {
+                len: region.len(),
+                base_addr: region.ptr().as_ptr(),
+                ..Default::default()
+            };
+            let mut flags = 0;
+            match region.mapping() {
+                Mapping::Host => {
+                    mr_attr.__bindgen_anon_1.mr_iov = &iov;
+                }
+                Mapping::Device { device_id, dmabuf_fd } => {
+                    mr_attr.iface = FI_HMEM_CUDA;
+                    mr_attr.device.cuda = device_id.0 as i32;
+                    match dmabuf_fd {
+                        None => mr_attr.__bindgen_anon_1.mr_iov = &iov,
+                        Some(dmabuf_fd) => {
+                            dmabuf.fd = *dmabuf_fd;
+                            mr_attr.__bindgen_anon_1.dmabuf = &dmabuf;
+                            flags = FI_MR_DMABUF;
+                        }
+                    }
+                }
+            }
+            let ret = unsafe {
+                let fi_mr_regattr =
+                    (*(*self.domain.as_ptr()).mr).regattr.unwrap_unchecked();
+                let domain_fid = &raw mut (*self.domain.as_ptr()).fid;
+                fi_mr_regattr(domain_fid, &mr_attr, flags, &raw mut mr)
+            };
+            (ret, mr)
         };
-        let mut flags = 0;
-        match region.mapping() {
-            Mapping::Host => {
-                mr_attr.__bindgen_anon_1.mr_iov = &iov;
+        #[cfg(not(feature = "cuda"))]
+        let (ret, mr) = {
+            if matches!(region.mapping(), Mapping::Device { .. }) {
+                return Err(FabricLibError::Custom(
+                    "CUDA memory requires fabric-lib's 'cuda' feature",
+                ));
             }
-            Mapping::Device { device_id, dmabuf_fd: None } => {
-                mr_attr.iface = FI_HMEM_CUDA;
-                mr_attr.device.cuda = device_id.0 as i32;
-                mr_attr.__bindgen_anon_1.mr_iov = &iov;
-            }
-            Mapping::Device { device_id, dmabuf_fd: Some(dmabuf_fd) } => {
-                mr_attr.iface = FI_HMEM_CUDA;
-                mr_attr.device.cuda = device_id.0 as i32;
-                dmabuf.fd = *dmabuf_fd;
-                mr_attr.__bindgen_anon_1.dmabuf = &dmabuf;
-                flags = FI_MR_DMABUF;
-            }
-        }
-
-        let ret = unsafe {
-            let fi_mr_regattr =
-                (*(*self.domain.as_ptr()).mr).regattr.unwrap_unchecked();
-            let domain_fid = &raw mut (*self.domain.as_ptr()).fid;
-            fi_mr_regattr(domain_fid, &mr_attr, flags, &raw mut mr)
+            let mut mr = null_mut();
+            let ret = unsafe {
+                let fi_mr_reg = (*(*self.domain.as_ptr()).mr).reg.unwrap_unchecked();
+                let domain_fid = &raw mut (*self.domain.as_ptr()).fid;
+                fi_mr_reg(
+                    domain_fid,
+                    region.ptr().as_ptr(),
+                    region.len(),
+                    access,
+                    0,
+                    0,
+                    0,
+                    &raw mut mr,
+                    null_mut(),
+                )
+            };
+            (ret, mr)
         };
 
-        let mr = NonNull::new(mr)
-            .ok_or_else(|| LibfabricError::new(ret, "fi_mr_regattr"))?;
+        #[cfg(feature = "cuda")]
+        let operation = "fi_mr_regattr";
+        #[cfg(not(feature = "cuda"))]
+        let operation = "fi_mr_reg";
+        let mr = NonNull::new(mr).ok_or_else(|| LibfabricError::new(ret, operation))?;
         self.local_mr_map.insert(region.ptr(), mr);
         Ok(MemoryRegionRemoteKey(unsafe { mr.as_ref() }.key))
     }
@@ -761,6 +796,13 @@ impl RdmaDomain for EfaDomain {
         dest_addr: DomainAddress,
         op: WriteOp,
     ) {
+        if matches!(&op, WriteOp::Batch { .. }) {
+            self.completions.push_back(DomainCompletionEntry::Error(
+                transfer_id,
+                FabricLibError::Custom("EFA does not support ordered write batches"),
+            ));
+            return;
+        }
         // Resolve the remote address
         let Ok(dest_fi_addr) = self.get_or_add_remote_addr(&dest_addr) else {
             self.completions.push_back(DomainCompletionEntry::Error(
@@ -774,12 +816,18 @@ impl RdmaDomain for EfaDomain {
         };
 
         self.do_submit_write(transfer_id, |rawctx, msg_buf| match op {
+            WriteOp::Batch { .. } => {
+                unreachable!("unsupported batch rejected before submission")
+            }
             WriteOp::Single(op) => WriteOpIter::Single(SingleWriteOpIter::new_single(
                 op,
                 dest_fi_addr,
                 msg_buf,
                 rawctx,
             )),
+            WriteOp::Gather(op) => {
+                WriteOpIter::Gather(GatherWriteOpIter::new(op, dest_fi_addr, rawctx))
+            }
             WriteOp::Imm(op) => WriteOpIter::Single(SingleWriteOpIter::new_imm(
                 op,
                 dest_fi_addr,

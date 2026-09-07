@@ -7,10 +7,12 @@ use std::{
     },
 };
 
-use cuda_lib::gdr::GdrFlag;
 use parking_lot::RwLock;
 
-use crate::api::{GdrCounter, ImmCounter};
+use crate::{
+    api::{GdrCounter, ImmCounter},
+    cuda_compat::gdr::GdrFlag,
+};
 
 pub enum ImmCount {
     Expected { counter: Arc<AtomicI64>, expected: NonZeroU32 },

@@ -30,6 +30,18 @@ fabric-lib: RDMA Point-to-Point Communication for LLM Systems
 * `SYS_PTRACE` and `SYS_ADMIN` Linux capabilities for `pidfd_getfd`. You can obtain these by running as root, with sudo, or inside docker with `--cap-add=SYS_PTRACE --cap-add=SYS_ADMIN`.
 * RDMA network with GPUDirect RDMA support. Each GPU should have at least one dedicated RDMA NIC.
 
+### Host-memory-only builds
+
+`fabric-lib` keeps CUDA support enabled by default. Applications that only register host memory
+can avoid the CUDA toolkit and GDRCopy build dependencies:
+
+```toml
+fabric-lib = { git = "https://github.com/ActivePeter/pplx-garden", default-features = false, features = ["tokio"] }
+```
+
+Host-only builds still require libfabric and libibverbs. Passing `Device::Cuda` returns an error
+unless the `cuda` feature is enabled.
+
 ## Docker dev image
 
 We provide a docker image for the convenience of development. You can build it with the following command:

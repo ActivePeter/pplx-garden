@@ -1,11 +1,15 @@
 use std::{ffi::c_void, ptr::NonNull};
 
-use cuda_lib::driver::cu_get_dma_buf_fd;
-use cuda_lib::rt::{cudaMemoryTypeDevice, cudaPointerGetAttributes};
-use cuda_lib::{CudaDeviceId, Device};
 use once_cell::sync::Lazy;
 
-use crate::error::{FabricLibError, Result};
+use crate::{
+    cuda_compat::{
+        CudaDeviceId, Device,
+        driver::cu_get_dma_buf_fd,
+        rt::{cudaMemoryTypeDevice, cudaPointerGetAttributes},
+    },
+    error::{FabricLibError, Result},
+};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub enum Mapping {

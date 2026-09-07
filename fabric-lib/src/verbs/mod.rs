@@ -6,3 +6,4 @@ mod verbs_rdma_op;
 
 pub use verbs_devinfo::{VerbsDeviceInfo, VerbsDeviceList};
 pub use verbs_domain::VerbsDomain;
+mod verbs_batch;

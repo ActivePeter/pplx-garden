@@ -10,14 +10,20 @@ use std::{
     },
 };
 
+use crate::cuda_compat::gdr::GdrFlag;
 use bytes::Bytes;
-use cuda_lib::gdr::GdrFlag;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::FabricLibError,
     utils::hex::{fmt_hex, from_hex},
 };
+
+pub const MAX_GATHER_SEGMENTS: usize = 4;
+/// A bounded linked WR list: 255 payloads and up to two notification-ring segments.
+pub const MAX_WRITE_BATCH_WR: usize = 257;
+/// RC write queues per domain/peer; batch lanes include this innermost dimension.
+pub const WRITE_QP_LANES: usize = 2;
 
 pub type SmallVec<T> = ::smallvec::SmallVec<[T; 4]>;
 
@@ -49,6 +55,8 @@ pub struct MemoryRegionDescriptor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransferId(pub u64);
+
+pub(crate) const REMOTE_CONFIRMED_OPERATION_BIT: u64 = 1 << 63;
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DomainAddress(pub Bytes);
@@ -136,6 +144,49 @@ pub struct SingleTransferRequest {
     pub domain: DomainGroupRouting,
 }
 
+/// One source segment in a gather write.
+#[derive(Clone, Debug)]
+pub struct GatherSegment {
+    pub src_mr: MemoryRegionHandle,
+    pub src_offset: u64,
+    pub length: u64,
+}
+
+/// Writes several registered source segments contiguously to one remote region.
+///
+/// All segments must belong to the same device, and at most [`MAX_GATHER_SEGMENTS`]
+/// are accepted. With sharded routing, the logical stream is split across domains and each
+/// domain posts one gather write. `imm_data` is attached to every shard, so receivers that use
+/// multiple domains must aggregate all matching notifications before consuming the payload.
+#[derive(Clone, Debug)]
+pub struct GatherTransferRequest {
+    /// Small RPC headers normally use two segments. Keep those descriptors inline instead of
+    /// allocating a Vec (and a second Arc allocation) for every submitted request and response.
+    pub segments: SmallVec<GatherSegment>,
+    pub imm_data: Option<u32>,
+    pub dst_mr: MemoryRegionDescriptor,
+    pub dst_offset: u64,
+    pub domain: DomainGroupRouting,
+}
+
+/// A registered gather write in an explicitly routed batch.
+#[derive(Clone, Debug)]
+pub struct BatchWrite {
+    pub segments: SmallVec<GatherSegment>,
+    pub dst_mr: MemoryRegionDescriptor,
+    pub dst_offset: u64,
+    pub imm_data: Option<u32>,
+}
+
+/// A bounded sequence posted on one actual RC QP, with only the final WR signaled.
+/// `lane` selects (host worker, domain, QP), in that order. Unlike
+/// separate pinned requests, its writes cannot rotate between a domain's internal RC QPs.
+#[derive(Clone, Debug)]
+pub struct WriteBatchRequest {
+    pub lane: usize,
+    pub writes: Vec<BatchWrite>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PagedTransferRequest {
     pub length: u64,
@@ -178,6 +229,8 @@ pub struct ScatterTransferRequest {
 pub enum TransferRequest {
     Imm(ImmTransferRequest),
     Single(SingleTransferRequest),
+    Gather(GatherTransferRequest),
+    WriteBatch(WriteBatchRequest),
     Paged(PagedTransferRequest),
     Scatter(ScatterTransferRequest),
     Barrier(BarrierTransferRequest),
@@ -189,9 +242,21 @@ pub enum TransferCompletionEntry {
     Send(TransferId),
     Transfer(TransferId),
     ImmData(u32),
+    Immediate(ImmediateEvent),
     ImmCountReached(u32),
     UvmWatch { id: UvmWatcherId, old: u64, new: u64 },
     Error(TransferId, FabricLibError),
+}
+
+/// An immediate notification together with the connection that produced its CQE.
+/// QP numbers are local to a domain; applications must use the complete identity, not `value`
+/// or `qp_num` alone, to select remotely writable memory belonging to a peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImmediateEvent {
+    pub value: u32,
+    pub local: DomainAddress,
+    pub peer: DomainAddress,
+    pub qp_num: u32,
 }
 
 /// A free-range immediate counter exposed to users.
@@ -240,11 +305,20 @@ impl GdrCounter {
 pub struct TransferCounter {
     counter: Arc<AtomicI64>,
     err_counter: Arc<AtomicI64>,
+    _guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl TransferCounter {
     pub fn new(counter: Arc<AtomicI64>, err_counter: Arc<AtomicI64>) -> Self {
-        Self { counter, err_counter }
+        Self { counter, err_counter, _guard: None }
+    }
+
+    pub fn with_guard(
+        counter: Arc<AtomicI64>,
+        err_counter: Arc<AtomicI64>,
+        guard: Arc<dyn Send + Sync>,
+    ) -> Self {
+        Self { counter, err_counter, _guard: Some(guard) }
     }
 
     pub(crate) fn error(&self) {

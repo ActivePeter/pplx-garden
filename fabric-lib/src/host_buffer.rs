@@ -1,10 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::{ffi::c_void, ptr::NonNull, sync::Arc};
 
-use cuda_lib::Device;
 use parking_lot::Mutex;
 
-use crate::{RdmaEngine, api::MemoryRegionHandle, error::Result};
+use crate::{RdmaEngine, api::MemoryRegionHandle, cuda_compat::Device, error::Result};
 
 pub struct HostBuffer {
     index: usize,

@@ -5,9 +5,9 @@ use std::{
     ptr::{NonNull, null_mut},
     rc::Rc,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
-use cuda_lib::Device;
 use libc::ENOMEM;
 use libibverbs_sys::{
     IBV_ACCESS_LOCAL_WRITE, IBV_ACCESS_RELAXED_ORDERING, IBV_ACCESS_REMOTE_READ,
@@ -24,18 +24,33 @@ use libibverbs_sys::{
     ibv_td_init_attr, ibv_wc, ibv_wc_status_str,
 };
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec as InlineVec;
 use tracing::{debug, error, warn};
 
 const MAX_OPS: usize = 1024;
 const CQ_DEPTH: usize = 4096;
+const RMA_QP_LANES: usize = crate::api::WRITE_QP_LANES;
 const NUM_IMM_RECVS: usize = 128;
 const GRH_BYTES: usize = 40;
 const MAX_UD_MSG_BYTES: usize = 4096;
 const NUM_UD_RECVS: usize = 128;
 const MAX_UD_SENDS: usize = 128;
+const MSG_QP_INLINE_BYTES: u32 = 256;
+// One verbs doorbell and one CQE retire a short burst of ordered SENDs. The final signaled WR
+// completes only after every preceding WR on the RC QP, so all source owners can be released at
+// that point without weakening completion semantics.
+const SEND_WR_BATCH: usize = 16;
+const SEND_SGES_PER_WR: usize = crate::api::MAX_GATHER_SEGMENTS;
+const MAX_SEND_BATCH: usize = SEND_WR_BATCH * SEND_SGES_PER_WR;
+const SEND_COALESCE_DELAY: Duration = Duration::ZERO;
+type SendBatch = InlineVec<[TransferId; MAX_SEND_BATCH]>;
 
 use crate::{
-    api::{DomainAddress, MemoryRegionRemoteKey, PeerGroupHandle, TransferId},
+    api::{
+        DomainAddress, ImmediateEvent, MemoryRegionRemoteKey, PeerGroupHandle,
+        TransferId,
+    },
+    cuda_compat::Device,
     error::{FabricLibError, Result, VerbsError},
     imm_count::{ImmCountMap, ImmCountStatus},
     mr::{Mapping, MemoryRegion, MemoryRegionLocalDescriptor},
@@ -43,12 +58,12 @@ use crate::{
     rdma_op::{GroupWriteOp, RecvOp, SendOp, WriteOp},
     utils::{defer::Defer, memory::MemoryPool, obj_pool::ObjectPool},
     verbs::{
-        verbs_address::{Gid, VerbsUDAddress},
+        verbs_address::{Gid, VerbsRCAddress, VerbsUDAddress},
         verbs_devinfo::VerbsDeviceInfo,
         verbs_qp::{RCQueuePair, UDQueuePair},
         verbs_rdma_op::{
-            PagedWriteOpIter, ScatterWriteOpIter, SingleWriteOpIter, WrChainBuffer,
-            WriteOpIter, fill_recv_op, fill_send_op,
+            GatherWriteOpIter, PagedWriteOpIter, ScatterWriteOpIter, SingleWriteOpIter,
+            WrChainBuffer, WriteOpIter, fill_recv_op, fill_send_ops,
         },
     },
 };
@@ -77,6 +92,9 @@ pub struct VerbsDomain {
     ud: UDQueuePair,
     addr: DomainAddress,
     peers: HashMap<DomainAddress, Peer>,
+    // Entries live as long as their RC QPs. A future disconnect must drain their CQEs before
+    // removing this identity or allowing the provider to reuse a QP number.
+    rma_peer_by_qp: HashMap<u32, DomainAddress>,
     connecting_peer_groups: HashMap<PeerGroupHandle, ConnectingPeerGroup>,
     peer_groups: HashMap<PeerGroupHandle, PeerGroup>,
     local_mr_map: HashMap<NonNull<c_void>, NonNull<ibv_mr>>,
@@ -87,6 +105,9 @@ pub struct VerbsDomain {
 
     recv_ops: VecDeque<RecvOpContext>,
     send_ops: VecDeque<SendOpContext>,
+    pending_send_batches: HashMap<NonNull<ibv_qp>, SendBatch>,
+    send_batches: HashMap<TransferId, SendBatch>,
+    failed_send_ids: HashSet<TransferId>,
     write_ops: VecDeque<NonNull<WriteOpContext>>,
     completions: VecDeque<DomainCompletionEntry>,
 
@@ -101,8 +122,30 @@ struct Peer {
     ud_addr: VerbsUDAddress,
     ah: NonNull<ibv_ah>,
     msg_rc: RCQueuePair,
-    rma_rc: RCQueuePair,
+    rma_rcs: Vec<RCQueuePair>,
+    next_rma_lane: usize,
     state: PeerState,
+}
+
+impl Peer {
+    fn primary_rma_qp(&self) -> NonNull<ibv_qp> {
+        self.rma_rcs[0].qp
+    }
+
+    fn next_rma_qp(&mut self) -> NonNull<ibv_qp> {
+        let qp = self.rma_rcs[self.next_rma_lane].qp;
+        self.next_rma_lane = (self.next_rma_lane + 1) % self.rma_rcs.len();
+        qp
+    }
+
+    fn write_qp_for(&mut self, op: &OutboundOp) -> NonNull<ibv_qp> {
+        match op {
+            OutboundOp::Write(WriteOp::Batch { qp_lane, .. }) => {
+                self.rma_rcs[*qp_lane].qp
+            }
+            _ => self.next_rma_qp(),
+        }
+    }
 }
 
 enum PeerState {
@@ -143,8 +186,7 @@ pub struct PeerHandshakeInfo {
     gid: Gid,
     msg_qp_num: u32,
     msg_psn: u32,
-    rma_qp_num: u32,
-    rma_psn: u32,
+    rma_rc_addrs: Vec<VerbsRCAddress>,
 }
 
 struct RecvOpContext {
@@ -155,6 +197,8 @@ struct RecvOpContext {
 struct SendOpContext {
     transfer_id: TransferId,
     msg_qp: NonNull<ibv_qp>,
+    max_inline_data: u32,
+    queued_at: Instant,
     op: SendOp,
 }
 
@@ -171,6 +215,7 @@ struct WriteOpContext {
     /// No more write ops will be posted.
     /// Once cnt_finished_ops catches up with cnt_posted_ops, the context will be dropped.
     bad: bool,
+    error: Option<String>,
 }
 
 impl VerbsDomain {
@@ -324,6 +369,7 @@ impl VerbsDomain {
                 ud,
                 addr,
                 peers: HashMap::new(),
+                rma_peer_by_qp: HashMap::new(),
                 connecting_peer_groups: HashMap::new(),
                 peer_groups: HashMap::new(),
                 local_mr_map: HashMap::new(),
@@ -334,6 +380,9 @@ impl VerbsDomain {
 
                 recv_ops: VecDeque::with_capacity(MAX_OPS),
                 send_ops: VecDeque::with_capacity(MAX_OPS),
+                pending_send_batches: HashMap::new(),
+                send_batches: HashMap::with_capacity(MAX_OPS),
+                failed_send_ids: HashSet::new(),
                 write_ops: VecDeque::with_capacity(MAX_OPS),
                 completions: VecDeque::with_capacity(MAX_OPS),
 
@@ -442,7 +491,7 @@ impl VerbsDomain {
     }
 
     fn create_peer(
-        &self,
+        &mut self,
         peer_addr: &DomainAddress,
         pending_submits: Vec<(TransferId, OutboundOp)>,
         pending_group_write_ops: Vec<NonNull<PendingGroupWriteOp>>,
@@ -461,16 +510,22 @@ impl VerbsDomain {
             self.lid,
             MAX_OPS as u32,
             msg_psn,
+            MSG_QP_INLINE_BYTES,
         )?;
-        let rma_rc = RCQueuePair::new(
-            self.cq,
-            self.pd,
-            self.rma_srq,
-            self.gid,
-            self.lid,
-            MAX_OPS as u32,
-            rma_psn,
-        )?;
+        let rma_rcs = (0..RMA_QP_LANES)
+            .map(|lane| {
+                RCQueuePair::new(
+                    self.cq,
+                    self.pd,
+                    self.rma_srq,
+                    self.gid,
+                    self.lid,
+                    MAX_OPS as u32,
+                    rma_psn + lane as u32,
+                    0,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Create Address Handle
         let mut ah_attr = ibv_ah_attr {
@@ -489,11 +544,15 @@ impl VerbsDomain {
             NonNull::new(unsafe { ibv_create_ah(self.pd.as_ptr(), &raw mut ah_attr) })
                 .ok_or_else(|| VerbsError::with_last_os_error("ibv_create_ah"))?;
 
+        for qp in &rma_rcs {
+            self.rma_peer_by_qp.insert(qp.addr.qp_num, peer_addr.clone());
+        }
         Ok(Peer {
             ud_addr: peer_ud_addr.clone(),
             ah,
             msg_rc,
-            rma_rc,
+            rma_rcs,
+            next_rma_lane: 0,
             state: PeerState::Connecting { pending_submits, pending_group_write_ops },
         })
     }
@@ -508,8 +567,7 @@ impl VerbsDomain {
             gid: self.gid,
             msg_qp_num: peer.msg_rc.addr.qp_num,
             msg_psn: peer.msg_rc.addr.psn,
-            rma_qp_num: peer.rma_rc.addr.qp_num,
-            rma_psn: peer.rma_rc.addr.psn,
+            rma_rc_addrs: peer.rma_rcs.iter().map(|qp| qp.addr.clone()).collect(),
         };
         self.ud_send(&peer.ud_addr, peer.ah, ud_buf, &handshake_info)?;
 
@@ -540,8 +598,15 @@ impl VerbsDomain {
         // Activate QP
 
         let pkey_index = 0; // TODO: get pkey_index
+        if info.rma_rc_addrs.len() != peer.rma_rcs.len() {
+            return Err(FabricLibError::Custom(
+                "Peer RMA queue-pair lane count mismatch",
+            ));
+        }
         peer.msg_rc.rc_reset_to_init(self.port_num, pkey_index)?;
-        peer.rma_rc.rc_reset_to_init(self.port_num, pkey_index)?;
+        for qp in &peer.rma_rcs {
+            qp.rc_reset_to_init(self.port_num, pkey_index)?;
+        }
 
         peer.msg_rc.rc_init_to_rtr(
             self.is_infiniband,
@@ -553,19 +618,23 @@ impl VerbsDomain {
             info.lid,
             info.gid,
         )?;
-        peer.rma_rc.rc_init_to_rtr(
-            self.is_infiniband,
-            self.gid_index,
-            self.port_num,
-            self.mtu,
-            info.rma_qp_num,
-            info.rma_psn,
-            info.lid,
-            info.gid,
-        )?;
+        for (qp, remote) in peer.rma_rcs.iter().zip(&info.rma_rc_addrs) {
+            qp.rc_init_to_rtr(
+                self.is_infiniband,
+                self.gid_index,
+                self.port_num,
+                self.mtu,
+                remote.qp_num,
+                remote.psn,
+                info.lid,
+                info.gid,
+            )?;
+        }
 
-        peer.msg_rc.rc_rtr_to_rts(info.msg_psn)?;
-        peer.rma_rc.rc_rtr_to_rts(info.rma_psn)?;
+        peer.msg_rc.rc_rtr_to_rts(peer.msg_rc.addr.psn)?;
+        for qp in &peer.rma_rcs {
+            qp.rc_rtr_to_rts(qp.addr.psn)?;
+        }
         // TODO: return error for pending submits if fails to connect.
         debug!(domain = self.name, ?peer_addr, "RC handshake completed");
 
@@ -583,9 +652,22 @@ impl VerbsDomain {
 
         // Submit pending submits
         let msg_qp = peer.msg_rc.qp;
-        let rma_qp = peer.rma_rc.qp;
-        for (transfer_id, op) in pending_submits {
-            self.do_submit_outbound_op(transfer_id, op, msg_qp, rma_qp);
+        let max_inline_data = peer.msg_rc.max_inline_data;
+        let rma_qp = peer.primary_rma_qp();
+        let pending_rma_qps = pending_submits
+            .iter()
+            .map(|(_, op)| peer.write_qp_for(op))
+            .collect::<Vec<_>>();
+        for ((transfer_id, op), rma_qp) in
+            pending_submits.into_iter().zip(pending_rma_qps)
+        {
+            self.do_submit_outbound_op(
+                transfer_id,
+                op,
+                msg_qp,
+                max_inline_data,
+                rma_qp,
+            );
         }
 
         // Check peer group
@@ -679,8 +761,15 @@ impl VerbsDomain {
                 // If connected, add to the op queue directly.
                 PeerState::Established => {
                     let msg_qp = peer.msg_rc.qp;
-                    let rma_qp = peer.rma_rc.qp;
-                    self.do_submit_outbound_op(transfer_id, op, msg_qp, rma_qp)
+                    let max_inline_data = peer.msg_rc.max_inline_data;
+                    let rma_qp = peer.write_qp_for(&op);
+                    self.do_submit_outbound_op(
+                        transfer_id,
+                        op,
+                        msg_qp,
+                        max_inline_data,
+                        rma_qp,
+                    )
                 }
                 // If connecting, queue the submit
                 PeerState::Connecting { pending_submits, .. } => {
@@ -717,14 +806,26 @@ impl VerbsDomain {
         transfer_id: TransferId,
         op: OutboundOp,
         msg_qp: NonNull<ibv_qp>,
+        max_inline_data: u32,
         rma_qp: NonNull<ibv_qp>,
     ) {
         match op {
             OutboundOp::Send(op) => {
-                self.send_ops.push_back(SendOpContext { transfer_id, msg_qp, op });
+                self.send_ops.push_back(SendOpContext {
+                    transfer_id,
+                    msg_qp,
+                    max_inline_data,
+                    queued_at: Instant::now(),
+                    op,
+                });
             }
             OutboundOp::Write(op) => {
                 self.do_submit_write(transfer_id, |rawctx, wr_chain_buffer| match op {
+                    WriteOp::Batch { writes, .. } => {
+                        WriteOpIter::Batch(super::verbs_batch::BatchWriteOpIter::new(
+                            writes, rma_qp, rawctx,
+                        ))
+                    }
                     WriteOp::Single(op) => {
                         WriteOpIter::Single(SingleWriteOpIter::new_single(
                             op,
@@ -733,6 +834,12 @@ impl VerbsDomain {
                             rawctx,
                         ))
                     }
+                    WriteOp::Gather(op) => WriteOpIter::Gather(GatherWriteOpIter::new(
+                        op,
+                        rma_qp,
+                        wr_chain_buffer,
+                        rawctx,
+                    )),
                     WriteOp::Imm(op) => WriteOpIter::Single(
                         SingleWriteOpIter::new_imm(op, rma_qp, wr_chain_buffer, rawctx),
                     ),
@@ -778,6 +885,7 @@ impl VerbsDomain {
                 cnt_finished_ops: 0,
                 in_queue: false,
                 bad: false,
+                error: None,
             })
         };
         let context_ptr = unsafe { NonNull::new_unchecked(context) };
@@ -840,21 +948,142 @@ impl VerbsDomain {
     }
 
     fn progress_rdma_send_ops(&mut self) {
-        let mut sge = MaybeUninit::uninit();
-        let mut wr = MaybeUninit::uninit();
+        let mut sges: [MaybeUninit<ibv_sge>; MAX_SEND_BATCH] =
+            std::array::from_fn(|_| MaybeUninit::uninit());
+        let mut wrs: [MaybeUninit<ibv_send_wr>; SEND_WR_BATCH] =
+            std::array::from_fn(|_| MaybeUninit::uninit());
+        let mut wr_logical_counts = [0_usize; SEND_WR_BATCH];
+        let mut wr_ids = [TransferId(0); SEND_WR_BATCH];
         let mut bad_wr = MaybeUninit::uninit();
-        while let Some(ctx) = self.send_ops.front() {
-            fill_send_op(&ctx.op, &mut sge, &mut wr, unsafe {
-                transmute::<TransferId, *mut libc::c_void>(ctx.transfer_id)
-            });
+        while let Some(first) = self.send_ops.front() {
+            let msg_qp = first.msg_qp;
+            if first.op.coalescible {
+                let mut candidates = 0_usize;
+                let mut blocked = false;
+                for ctx in self.send_ops.iter().take(SEND_SGES_PER_WR) {
+                    if ctx.msg_qp != msg_qp || !ctx.op.coalescible {
+                        blocked = true;
+                        break;
+                    }
+                    candidates += 1;
+                }
+                if candidates < SEND_SGES_PER_WR
+                    && !blocked
+                    && first.queued_at.elapsed() < SEND_COALESCE_DELAY
+                {
+                    break;
+                }
+            }
+            let max_inline_data = first.max_inline_data;
+            let mut contexts = self.send_ops.iter().peekable();
+            let mut wr_count = 0_usize;
+            let mut logical_count = 0_usize;
+            while wr_count < SEND_WR_BATCH {
+                let Some(ctx) = contexts.next() else {
+                    break;
+                };
+                if ctx.msg_qp != msg_qp {
+                    break;
+                }
+                let mut group_count = 1_usize;
+                let mut last_id = ctx.transfer_id;
+                if ctx.op.coalescible {
+                    while group_count < SEND_SGES_PER_WR {
+                        let Some(next) = contexts.peek() else {
+                            break;
+                        };
+                        if next.msg_qp != msg_qp || !next.op.coalescible {
+                            break;
+                        }
+                        let next =
+                            contexts.next().expect("peeked SEND context disappeared");
+                        group_count += 1;
+                        last_id = next.transfer_id;
+                    }
+                }
+                wr_logical_counts[wr_count] = group_count;
+                wr_ids[wr_count] = last_id;
+                logical_count += group_count;
+                wr_count += 1;
+            }
+            debug_assert!(wr_count > 0 && logical_count > 0);
+
+            let mut contexts = self.send_ops.iter();
+            let mut sge_offset = 0_usize;
+            for index in 0..wr_count {
+                let group_count = wr_logical_counts[index];
+                fill_send_ops(
+                    contexts.by_ref().take(group_count).map(|ctx| &ctx.op),
+                    &mut sges[sge_offset..sge_offset + group_count],
+                    &mut wrs[index],
+                    unsafe {
+                        transmute::<TransferId, *mut libc::c_void>(wr_ids[index])
+                    },
+                    max_inline_data,
+                );
+                sge_offset += group_count;
+            }
+            for index in 0..wr_count {
+                let next = if index + 1 < wr_count {
+                    wrs[index + 1].as_mut_ptr()
+                } else {
+                    null_mut()
+                };
+                let wr = unsafe { wrs[index].assume_init_mut() };
+                wr.next = next;
+                if index + 1 < wr_count {
+                    wr.send_flags &= !IBV_SEND_SIGNALED;
+                }
+            }
             let ret = unsafe {
-                ibv_post_send(ctx.msg_qp.as_ptr(), wr.as_mut_ptr(), bad_wr.as_mut_ptr())
+                ibv_post_send(msg_qp.as_ptr(), wrs[0].as_mut_ptr(), bad_wr.as_mut_ptr())
             };
             match ret {
                 0 => {
-                    self.send_ops.pop_front();
+                    let mut batch =
+                        self.pending_send_batches.remove(&msg_qp).unwrap_or_default();
+                    for _ in 0..logical_count {
+                        batch.push(
+                            self.send_ops
+                                .pop_front()
+                                .expect("SEND batch length was counted")
+                                .transfer_id,
+                        );
+                    }
+                    // A single signaled SEND already carries its own transfer ID in `wr_id`.
+                    // Avoid a HashMap insert/remove pair for that common latency-oriented case;
+                    // only a genuinely coalesced completion needs an explicit retirement batch.
+                    if batch.len() > 1 {
+                        let signaled =
+                            *batch.last().expect("SEND batch cannot be empty");
+                        let replaced = self.send_batches.insert(signaled, batch);
+                        debug_assert!(replaced.is_none());
+                    }
                 }
-                ENOMEM => break,
+                ENOMEM => {
+                    let bad = unsafe { bad_wr.assume_init() };
+                    let posted_wrs = (0..wr_count)
+                        .find(|index| wrs[*index].as_mut_ptr() == bad)
+                        .expect("ibv_post_send returned an invalid bad WR pointer");
+                    if posted_wrs > 0 {
+                        let posted =
+                            wr_logical_counts[..posted_wrs].iter().sum::<usize>();
+                        let pending =
+                            self.pending_send_batches.entry(msg_qp).or_default();
+                        for _ in 0..posted {
+                            pending.push(
+                                self.send_ops
+                                    .pop_front()
+                                    .expect("partially posted SEND batch length was counted")
+                                    .transfer_id,
+                            );
+                        }
+                    }
+                    // Poll the CQ and let the device recover SQ entries before retrying. Any
+                    // posted prefix is deliberately unsignaled and is retired by the final WR of
+                    // the continuation batch.
+                    break;
+                }
                 _ => panic!("ibv_post_send returned undocumented error: {}", ret),
             }
         }
@@ -872,28 +1101,48 @@ impl VerbsDomain {
             }
 
             let ret = unsafe { ibv_post_send(rma_qp, wr, bad_wr.as_mut_ptr()) };
-            match ret {
-                0 => {
-                    context.rdma_op_iter.advance(wr_len);
-                    context.cnt_posted_ops += wr_len;
-                }
-                ENOMEM => {
-                    // Count the number of ops that are posted.
-                    let bad_wr = unsafe { bad_wr.assume_init() };
-                    let mut cur = wr;
-                    let mut cnt = 0;
-                    while cur != bad_wr {
-                        cur = unsafe { (*cur).next };
-                        cnt += 1;
-                    }
-                    context.rdma_op_iter.advance(cnt);
-                    context.cnt_posted_ops += cnt;
-
-                    // Busy. Break and try again later.
-                    break;
-                }
-                _ => panic!("ibv_post_send returned undocumented error: {}", ret),
+            if ret == 0 {
+                context.rdma_op_iter.advance(wr_len);
+                context.cnt_posted_ops += wr_len;
+                continue;
             }
+            // Every nonzero return can have a successfully posted prefix, not only ENOMEM.
+            let bad_wr = unsafe { bad_wr.assume_init() };
+            let mut cur = wr;
+            let mut count = 0;
+            while cur != bad_wr && !cur.is_null() && count < wr_len {
+                cur = unsafe { (*cur).next };
+                count += 1;
+            }
+            context.rdma_op_iter.advance(count);
+            context.cnt_posted_ops += count;
+            if ret == ENOMEM {
+                break;
+            }
+            context.error.get_or_insert_with(|| format!("ibv_post_send failed: {ret}"));
+            if let WriteOpIter::Batch(batch) = &mut context.rdma_op_iter
+                && batch.abort_tail()
+            {
+                context.total_ops = batch.total_ops();
+                continue;
+            }
+            // Legacy WRs are individually signaled. If even a batch drain marker cannot be
+            // posted, put the QP in error and retain the context until flush CQEs retire it.
+            // A prefix that already completed unsignaled may have no CQE; in that exceptional
+            // case its source guard intentionally survives until engine teardown, never DMA UAF.
+            context.bad = true;
+            let mut attr = libibverbs_sys::ibv_qp_attr {
+                qp_state: libibverbs_sys::IBV_QPS_ERR,
+                ..Default::default()
+            };
+            unsafe {
+                libibverbs_sys::ibv_modify_qp(
+                    rma_qp,
+                    &raw mut attr,
+                    libibverbs_sys::IBV_QP_STATE as i32,
+                );
+            }
+            break;
         }
     }
 
@@ -914,8 +1163,40 @@ impl VerbsDomain {
         if context.in_queue {
             return;
         }
+        // Do not release a source owner on the first error CQE: later WRs may still DMA it.
+        // A tail CQE, or the last posted error/flush index, retires the complete prefix.
+        if let Some(error) = context.error.take() {
+            self.completions.push_back(DomainCompletionEntry::Error(
+                context.transfer_id,
+                FabricLibError::VerbsCompletionError(error),
+            ));
+        } else if context.cnt_finished_ops == context.total_ops {
+            self.completions
+                .push_back(DomainCompletionEntry::Transfer(context.transfer_id));
+        } else {
+            return;
+        }
         unsafe { self.objpool_wr.free_and_drop(context.wr_chain_buffer) };
         unsafe { self.objpool_write_op.free_and_drop(ptr) };
+    }
+
+    fn complete_write(&mut self, wr_id: u64, error: Option<String>) {
+        let (parent, index) =
+            unsafe { super::verbs_batch::write_completion_context(wr_id) };
+        let Some(context) = (unsafe { parent.cast::<WriteOpContext>().as_mut() })
+        else {
+            return;
+        };
+        if let Some(index) = index {
+            context.cnt_finished_ops = context.cnt_finished_ops.max(index + 1);
+        } else {
+            context.cnt_finished_ops += 1;
+        }
+        if let Some(error) = error {
+            context.bad = true;
+            context.error.get_or_insert(error);
+        }
+        self.maybe_drop_write_op_context(unsafe { NonNull::new_unchecked(context) });
     }
 
     fn progress_rdma_write_ops(&mut self) {
@@ -941,7 +1222,9 @@ impl VerbsDomain {
             }
 
             // This transfer is done. Progress the next one.
+            context.in_queue = false;
             self.write_ops.pop_front();
+            self.maybe_drop_write_op_context(ptr);
         }
     }
 
@@ -992,29 +1275,47 @@ impl VerbsDomain {
 
         // Check if the completion is an error.
         if wc.status != IBV_WC_SUCCESS {
+            // `opcode` is not guaranteed valid for error CQEs. Identify our RMA QP instead.
+            if self.rma_peer_by_qp.contains_key(&wc.qp_num) {
+                if wc.wr_id != 0 {
+                    let message =
+                        unsafe { CStr::from_ptr(ibv_wc_status_str(wc.status)) }
+                            .to_string_lossy()
+                            .into_owned();
+                    self.complete_write(wc.wr_id, Some(message));
+                }
+                return None;
+            }
             let transfer_id: Option<TransferId> = match wc.opcode {
-                IBV_WC_RECV | IBV_WC_SEND => {
-                    Some(unsafe { transmute::<u64, TransferId>(wc.wr_id) })
+                IBV_WC_RECV => Some(unsafe { transmute::<u64, TransferId>(wc.wr_id) }),
+                IBV_WC_SEND => {
+                    let transfer_id = unsafe { transmute::<u64, TransferId>(wc.wr_id) };
+                    if let Some(batch) = self.send_batches.remove(&transfer_id) {
+                        let errmsg = unsafe {
+                            CStr::from_ptr(ibv_wc_status_str(wc.status))
+                                .to_string_lossy()
+                                .into_owned()
+                        };
+                        for member in batch {
+                            if self.failed_send_ids.remove(&member) {
+                                continue;
+                            }
+                            self.completions.push_back(DomainCompletionEntry::Error(
+                                member,
+                                FabricLibError::VerbsCompletionError(errmsg.clone()),
+                            ));
+                        }
+                        return None;
+                    } else {
+                        // An error CQE can be generated for an unsignaled prefix. Complete it now
+                        // and suppress the duplicate when the batch-tail CQE is processed.
+                        self.failed_send_ids.insert(transfer_id);
+                        Some(transfer_id)
+                    }
                 }
                 IBV_WC_RDMA_WRITE => {
-                    if let Some(context) =
-                        unsafe { (wc.wr_id as *mut WriteOpContext).as_mut() }
-                    {
-                        context.cnt_finished_ops += 1;
-                        let ret = if context.bad {
-                            None
-                        } else {
-                            // Return error to the caller only once.
-                            context.bad = true;
-                            Some(context.transfer_id)
-                        };
-                        self.maybe_drop_write_op_context(unsafe {
-                            NonNull::new_unchecked(context)
-                        });
-                        ret
-                    } else {
-                        None
-                    }
+                    // RMA CQEs were handled above using the connection identity.
+                    None
                 }
                 _ => None,
             };
@@ -1058,20 +1359,22 @@ impl VerbsDomain {
             }
             IBV_WC_SEND => {
                 let transfer_id: TransferId = unsafe { transmute(wc.wr_id) };
-                Some(DomainCompletionEntry::Send(transfer_id))
+                if let Some(batch) = self.send_batches.remove(&transfer_id) {
+                    for member in batch {
+                        if !self.failed_send_ids.remove(&member) {
+                            self.completions
+                                .push_back(DomainCompletionEntry::Send(member));
+                        }
+                    }
+                    None
+                } else {
+                    // Single-SEND posts use the WR ID directly and deliberately have no batch.
+                    Some(DomainCompletionEntry::Send(transfer_id))
+                }
             }
             IBV_WC_RDMA_WRITE => {
-                let context = unsafe { (wc.wr_id as *mut WriteOpContext).as_mut() }?;
-                context.cnt_finished_ops += 1;
-                if context.cnt_finished_ops < context.total_ops {
-                    return None;
-                }
-                // Transfer is done.
-                let transfer_id = context.transfer_id;
-                self.maybe_drop_write_op_context(unsafe {
-                    NonNull::new_unchecked(context)
-                });
-                Some(DomainCompletionEntry::Transfer(transfer_id))
+                self.complete_write(wc.wr_id, None);
+                None
             }
             IBV_WC_RECV_RDMA_WITH_IMM => {
                 // Submit zero-byte RECV for WRITE_IMM.
@@ -1081,7 +1384,15 @@ impl VerbsDomain {
                 // Return different types of completions.
                 let imm = unsafe { wc.__bindgen_anon_1.imm_data };
                 match self.imm_count_map.inc(imm) {
-                    ImmCountStatus::Vacant => Some(DomainCompletionEntry::ImmData(imm)),
+                    ImmCountStatus::Vacant => {
+                        let peer = self.rma_peer_by_qp.get(&wc.qp_num)?.clone();
+                        Some(DomainCompletionEntry::Immediate(ImmediateEvent {
+                            value: imm,
+                            local: self.addr.clone(),
+                            peer,
+                            qp_num: wc.qp_num,
+                        }))
+                    }
                     ImmCountStatus::NotReached => None,
                     ImmCountStatus::Reached => {
                         Some(DomainCompletionEntry::ImmCountReached(imm))
@@ -1139,6 +1450,10 @@ impl RdmaDomain for VerbsDomain {
 
     fn addr(&self) -> DomainAddress {
         self.addr.clone()
+    }
+
+    fn supports_write_batch(&self) -> bool {
+        true
     }
 
     fn link_speed(&self) -> u64 {
@@ -1210,7 +1525,7 @@ impl RdmaDomain for VerbsDomain {
         let mut pending_peers = HashSet::new();
         for addr in addrs.iter() {
             if let Some(peer) = self.peers.get(addr) {
-                rma_qps.push(peer.rma_rc.qp);
+                rma_qps.push(peer.primary_rma_qp());
             } else {
                 // Initiate peer connection
                 let peer = self.create_peer(addr, vec![], vec![])?;
@@ -1221,7 +1536,7 @@ impl RdmaDomain for VerbsDomain {
                 )?;
                 self.connect_peer(peer, buf)?;
 
-                let rma_qp = peer.rma_rc.qp;
+                let rma_qp = peer.primary_rma_qp();
                 rma_qps.push(rma_qp);
                 pending_peers.insert(rma_qp);
             }
@@ -1268,7 +1583,7 @@ impl RdmaDomain for VerbsDomain {
             let mut maybe_ctx_ptr = None;
             for addr in op.peer_addr_iter() {
                 if let Some(peer) = self.peers.get(addr) {
-                    rma_qps.push(peer.rma_rc.qp);
+                    rma_qps.push(peer.primary_rma_qp());
                 } else {
                     // Initiate peer connection
                     let ctx_ptr = if let Some(ctx_ptr) = maybe_ctx_ptr {
@@ -1304,7 +1619,7 @@ impl RdmaDomain for VerbsDomain {
                     }
 
                     let peer = unsafe { self.peers.get_mut(addr).unwrap_unchecked() };
-                    let rma_qp = peer.rma_rc.qp;
+                    let rma_qp = peer.primary_rma_qp();
                     rma_qps.push(rma_qp);
                     pending_peers.insert(rma_qp);
                 }
@@ -1342,14 +1657,18 @@ impl Drop for VerbsDomain {
         debug!(name = self.name, "VerbsDomain::drop");
         // TODO: drop only_qp and ud
         unsafe {
+            for (_, mut peer) in self.peers.drain() {
+                peer.msg_rc.destroy();
+                for qp in &mut peer.rma_rcs {
+                    qp.destroy();
+                }
+            }
+            self.ud.destroy();
+            // Destroy every QP before deregistration; a stopped progress thread can still have
+            // outstanding DMA, including a partially posted unsignaled batch.
             for (_, mr) in self.local_mr_map.drain() {
                 ibv_dereg_mr(mr.as_ptr());
             }
-            for (_, mut peer) in self.peers.drain() {
-                peer.msg_rc.destroy();
-                peer.rma_rc.destroy();
-            }
-            self.ud.destroy();
             ibv_destroy_cq(self.cq.as_ptr());
             ibv_dealloc_pd(self.pd.as_ptr());
             ibv_dealloc_pd(self.mt_pd.as_ptr());

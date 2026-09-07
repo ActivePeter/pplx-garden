@@ -1,6 +1,8 @@
+#[cfg(feature = "efa")]
 use std::ffi::CStr;
 
-use cuda_lib::{driver::CudaDriverError, rt::CudartError};
+use crate::cuda_compat::{driver::CudaDriverError, rt::CudartError};
+#[cfg(feature = "efa")]
 use libfabric_sys::fi_strerror;
 use syscalls::Errno;
 
@@ -8,6 +10,9 @@ pub type Result<T> = std::result::Result<T, FabricLibError>;
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum FabricLibError {
+    #[error("bounded transfer admission is full; no work was submitted")]
+    Full,
+    #[cfg(feature = "efa")]
     #[error("{0}")]
     Libfabric(#[from] LibfabricError),
     #[error("DomainError: {0}")]
@@ -28,18 +33,21 @@ pub enum FabricLibError {
     Custom(&'static str),
 }
 
+#[cfg(feature = "efa")]
 #[derive(Clone, Debug)]
 pub struct LibfabricError {
     pub code: i32,
     pub context: &'static str,
 }
 
+#[cfg(feature = "efa")]
 impl LibfabricError {
     pub fn new(code: i32, context: &'static str) -> Self {
         Self { code, context }
     }
 }
 
+#[cfg(feature = "efa")]
 impl std::fmt::Display for LibfabricError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -52,6 +60,7 @@ impl std::fmt::Display for LibfabricError {
     }
 }
 
+#[cfg(feature = "efa")]
 impl std::error::Error for LibfabricError {}
 
 #[derive(Clone, Debug, thiserror::Error)]

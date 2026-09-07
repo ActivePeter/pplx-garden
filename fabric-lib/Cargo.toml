@@ -4,14 +4,16 @@ name = "fabric-lib"
 publish = false
 
 [features]
-default = []
+default = ["cuda"]
+cuda = ["dep:cuda-lib", "efa"]
+efa = ["dep:libfabric-sys"]
 tokio = ["dep:tokio", "tokio/sync", "tokio/rt-multi-thread"]
 
 [dependencies]
-libfabric-sys = { path = "./libfabric-sys" }
+libfabric-sys = { path = "./libfabric-sys", optional = true }
 libibverbs-sys = { path = "./libibverbs-sys" }
 
-cuda-lib = { workspace = true }
+cuda-lib = { workspace = true, optional = true }
 thread-lib = { workspace = true }
 
 anyhow = { workspace = true }
@@ -28,7 +30,9 @@ smallvec = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 syscalls = { workspace = true }
-mockall = { workspace = true }
 
 # Optional dependencies
 tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+mockall = { workspace = true }

@@ -2,17 +2,17 @@ use std::{cmp::min, collections::HashMap, ffi::c_void, ptr::NonNull, sync::Arc};
 
 use crate::{
     api::{
-        DomainAddress, DomainGroupRouting, GroupTransferRouting,
-        MemoryRegionDescriptor, MemoryRegionHandle, PagedTransferRequest,
-        PeerGroupHandle, ScatterTransferRequest, SingleTransferRequest, SmallVec,
-        TransferCounter, TransferId, TransferRequest,
+        DomainAddress, DomainGroupRouting, GatherTransferRequest, GroupTransferRouting,
+        MAX_GATHER_SEGMENTS, MemoryRegionDescriptor, MemoryRegionHandle,
+        PagedTransferRequest, PeerGroupHandle, ScatterTransferRequest,
+        SingleTransferRequest, SmallVec, TransferCounter, TransferId, TransferRequest,
     },
     error::{FabricLibError, Result},
     mr::MemoryRegion,
     provider::{DomainCompletionEntry, RdmaDomain},
     rdma_op::{
-        GroupWriteOp, ImmWriteOp, PagedWriteOp, RecvOp, ScatterGroupWriteOp, SendOp,
-        SingleWriteOp, WriteOp,
+        GatherSource, GatherWriteOp, GroupWriteOp, ImmWriteOp, PagedWriteOp, RecvOp,
+        ScatterGroupWriteOp, SendOp, SingleWriteOp, WriteOp,
     },
 };
 
@@ -28,6 +28,18 @@ struct WriteOpContext {
     num_used_domains: usize,
     cnt_domain_completion: usize,
     tx_counter: Option<TransferCounter>,
+    error: Option<FabricLibError>,
+    admission: Option<Arc<dyn Send + Sync>>,
+}
+
+impl WriteOpContext {
+    fn retire_domain(&mut self, error: Option<FabricLibError>) -> bool {
+        self.cnt_domain_completion += 1;
+        if self.error.is_none() {
+            self.error = error;
+        }
+        self.cnt_domain_completion == self.num_used_domains
+    }
 }
 
 struct PeerGroup {
@@ -47,6 +59,10 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
 
     pub fn aggregate_link_speed(&self) -> u64 {
         self.domains.iter().map(|d| d.link_speed()).sum()
+    }
+
+    pub fn supports_write_batch(&self) -> bool {
+        self.domains.iter().all(RdmaDomain::supports_write_batch)
     }
 
     pub fn register_mr_allow_remote(
@@ -126,6 +142,12 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
             TransferRequest::Single(request) => {
                 self.submit_single_transfer_request(transfer_id, request, tx_counter)
             }
+            TransferRequest::Gather(request) => {
+                self.submit_gather_transfer_request(transfer_id, request, tx_counter)
+            }
+            TransferRequest::WriteBatch(request) => {
+                self.submit_write_batch(transfer_id, request, tx_counter)
+            }
             TransferRequest::Paged(request) => {
                 self.submit_paged_transfer_request(transfer_id, request, tx_counter)
             }
@@ -133,6 +155,117 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                 self.submit_scatter_transfer_request(transfer_id, request, tx_counter)
             }
         }
+    }
+
+    pub fn submit_transfer_request_guarded(
+        &mut self,
+        id: TransferId,
+        request: TransferRequest,
+        counter: Option<TransferCounter>,
+        admission: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.submit_transfer_request(id, request, counter)?;
+        if let Some(context) = self.write_ops.get_mut(&id) {
+            context.admission = admission;
+        }
+        Ok(())
+    }
+
+    fn submit_write_batch(
+        &mut self,
+        transfer_id: TransferId,
+        request: crate::api::WriteBatchRequest,
+        tx_counter: Option<TransferCounter>,
+    ) -> Result<()> {
+        use crate::api::MAX_WRITE_BATCH_WR;
+        if request.writes.is_empty() || request.writes.len() > MAX_WRITE_BATCH_WR {
+            return Err(FabricLibError::Custom("invalid write batch length"));
+        }
+        let domain_index = request.lane / crate::api::WRITE_QP_LANES;
+        let domain = self
+            .domains
+            .get_mut(domain_index)
+            .ok_or(FabricLibError::Custom("write batch lane is out of bounds"))?;
+        if !domain.supports_write_batch() {
+            return Err(FabricLibError::Custom(
+                "provider does not support ordered write batches",
+            ));
+        }
+        let mut destination = None;
+        let mut ops = Vec::with_capacity(request.writes.len());
+        // Validate the complete list before submitting any write to the domain.
+        for write in request.writes {
+            if write.dst_mr.addr_rkey_list.len() != N
+                || (write.segments.is_empty() && write.imm_data.is_none())
+                || write.segments.len() > MAX_GATHER_SEGMENTS
+            {
+                return Err(FabricLibError::Custom(
+                    "invalid write batch registration or segments",
+                ));
+            }
+            let (address, rkey) = &write.dst_mr.addr_rkey_list[domain_index];
+            if destination.as_ref().is_some_and(|old| old != address) {
+                return Err(FabricLibError::Custom(
+                    "write batch destinations use different peers",
+                ));
+            }
+            destination = Some(address.clone());
+            let mut sources = SmallVec::new();
+            let mut length = 0_u64;
+            for segment in write.segments {
+                length = length
+                    .checked_add(segment.length)
+                    .ok_or(FabricLibError::Custom("write batch length overflow"))?;
+                if segment.length == 0 || length > u32::MAX as u64 {
+                    return Err(FabricLibError::Custom(
+                        "write batch exceeds SGE length limit",
+                    ));
+                }
+                (segment.src_mr.ptr.as_ptr() as u64)
+                    .checked_add(segment.src_offset)
+                    .and_then(|start| start.checked_add(segment.length))
+                    .ok_or(FabricLibError::Custom("write batch source overflow"))?;
+                sources.push(GatherSource {
+                    src_ptr: segment.src_mr.ptr,
+                    src_desc: domain.get_mem_desc(segment.src_mr.ptr)?,
+                    src_offset: segment.src_offset,
+                    length: segment.length,
+                });
+            }
+            write
+                .dst_mr
+                .ptr
+                .checked_add(write.dst_offset)
+                .and_then(|start| start.checked_add(length))
+                .ok_or(FabricLibError::Custom("write batch destination overflow"))?;
+            ops.push(GatherWriteOp {
+                sources,
+                length,
+                imm_data: write.imm_data,
+                dst_ptr: write.dst_mr.ptr,
+                dst_rkey: *rkey,
+                dst_offset: write.dst_offset,
+            });
+        }
+        self.write_ops.insert(
+            transfer_id,
+            WriteOpContext {
+                num_used_domains: 1,
+                cnt_domain_completion: 0,
+                tx_counter,
+                error: None,
+                admission: None,
+            },
+        );
+        domain.submit_write(
+            transfer_id,
+            destination.unwrap(),
+            WriteOp::Batch {
+                qp_lane: request.lane % crate::api::WRITE_QP_LANES,
+                writes: ops,
+            },
+        );
+        Ok(())
     }
 
     pub fn submit_imm_transfer_request(
@@ -159,6 +292,8 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                 num_used_domains: dst_mrs.len(),
                 cnt_domain_completion: 0,
                 tx_counter,
+                error: None,
+                admission: None,
             },
         );
 
@@ -271,7 +406,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                 dst_rkey: *dst_rkey,
                 dst_offset: request.dst_offset + offset as u64,
             });
-            rdma_ops.push((op, dst_addr));
+            rdma_ops.push((i, op, dst_addr.clone()));
         }
 
         // Bookkeeping
@@ -281,12 +416,141 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                 num_used_domains: rdma_ops.len(),
                 cnt_domain_completion: 0,
                 tx_counter,
+                error: None,
+                admission: None,
             },
         );
 
         // Submit the transfer request to each domain
-        for (domain, (rdma_op, dst_addr)) in self.domains.iter_mut().zip(rdma_ops) {
-            domain.submit_write(transfer_id, dst_addr.clone(), rdma_op);
+        for (domain_idx, rdma_op, dst_addr) in rdma_ops {
+            self.domains[domain_idx].submit_write(transfer_id, dst_addr, rdma_op);
+        }
+        Ok(())
+    }
+
+    pub fn submit_gather_transfer_request(
+        &mut self,
+        transfer_id: TransferId,
+        request: GatherTransferRequest,
+        tx_counter: Option<TransferCounter>,
+    ) -> Result<()> {
+        if request.segments.is_empty()
+            || request.segments.iter().any(|part| part.length == 0)
+        {
+            return Err(FabricLibError::Custom(
+                "GatherTransferRequest requires non-empty segments",
+            ));
+        }
+        if request.segments.len() > MAX_GATHER_SEGMENTS {
+            return Err(FabricLibError::Custom(
+                "GatherTransferRequest has too many segments",
+            ));
+        }
+        if request.segments.iter().any(|part| part.length > u32::MAX as u64) {
+            return Err(FabricLibError::Custom(
+                "GatherTransferRequest segment exceeds the verbs SGE length limit",
+            ));
+        }
+        if request.dst_mr.addr_rkey_list.len() != self.domains.len() {
+            return Err(FabricLibError::Custom(
+                "Number of target addresses must match the number of domains",
+            ));
+        }
+
+        let num_shards = match request.domain {
+            DomainGroupRouting::RoundRobinSharded { num_shards } => {
+                if num_shards.get() as usize > self.domains.len() {
+                    return Err(FabricLibError::Custom(
+                        "DomainGroupRouting::RoundRobinSharded.num_shards is greater than the number of domains",
+                    ));
+                }
+                num_shards.get() as usize
+            }
+            DomainGroupRouting::Pinned { domain_idx } => {
+                if domain_idx as usize >= self.domains.len() {
+                    return Err(FabricLibError::Custom(
+                        "DomainGroupRouting::Pinned.domain_idx is out of bounds",
+                    ));
+                }
+                1
+            }
+        };
+
+        let length = request.segments.iter().try_fold(0_u64, |length, segment| {
+            length.checked_add(segment.length).ok_or(FabricLibError::Custom(
+                "GatherTransferRequest destination range overflows",
+            ))
+        })?;
+        let length_usize = usize::try_from(length).map_err(|_| {
+            FabricLibError::Custom("GatherTransferRequest length does not fit usize")
+        })?;
+        let ranges = divide_evenly(length_usize, num_shards);
+        let first_domain = match request.domain {
+            DomainGroupRouting::RoundRobinSharded { .. } => self.rr_next,
+            DomainGroupRouting::Pinned { domain_idx } => domain_idx as usize,
+        };
+        if matches!(request.domain, DomainGroupRouting::RoundRobinSharded { .. }) {
+            self.rr_next = (self.rr_next + ranges.len()) % self.domains.len();
+        }
+
+        let mut rdma_ops = SmallVec::with_capacity(ranges.len());
+        for (shard_index, (begin, end)) in ranges.into_iter().enumerate() {
+            let domain_idx = (first_domain + shard_index) % self.domains.len();
+            let domain = &mut self.domains[domain_idx];
+            let (dst_addr, dst_rkey) = &request.dst_mr.addr_rkey_list[domain_idx];
+            let mut sources = SmallVec::with_capacity(request.segments.len());
+            let mut logical_offset = 0_usize;
+            for segment in request.segments.iter() {
+                let segment_len = segment.length as usize;
+                let segment_end = logical_offset + segment_len;
+                let overlap_begin = begin.max(logical_offset);
+                let overlap_end = end.min(segment_end);
+                if overlap_begin < overlap_end {
+                    let src_desc = domain.get_mem_desc(segment.src_mr.ptr)?;
+                    sources.push(GatherSource {
+                        src_ptr: segment.src_mr.ptr,
+                        src_desc,
+                        src_offset: segment.src_offset
+                            + (overlap_begin - logical_offset) as u64,
+                        length: (overlap_end - overlap_begin) as u64,
+                    });
+                }
+                logical_offset = segment_end;
+                if logical_offset >= end {
+                    break;
+                }
+            }
+            if sources.is_empty() {
+                return Err(FabricLibError::Custom(
+                    "GatherTransferRequest produced an empty shard",
+                ));
+            }
+            rdma_ops.push((
+                domain_idx,
+                dst_addr.clone(),
+                WriteOp::Gather(GatherWriteOp {
+                    sources,
+                    imm_data: request.imm_data,
+                    dst_ptr: request.dst_mr.ptr,
+                    dst_rkey: *dst_rkey,
+                    dst_offset: request.dst_offset + begin as u64,
+                    length: (end - begin) as u64,
+                }),
+            ));
+        }
+
+        self.write_ops.insert(
+            transfer_id,
+            WriteOpContext {
+                num_used_domains: rdma_ops.len(),
+                cnt_domain_completion: 0,
+                tx_counter,
+                error: None,
+                admission: None,
+            },
+        );
+        for (domain_idx, dst_addr, rdma_op) in rdma_ops {
+            self.domains[domain_idx].submit_write(transfer_id, dst_addr, rdma_op);
         }
         Ok(())
     }
@@ -320,6 +584,8 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                 num_used_domains: page_range.len(),
                 cnt_domain_completion: 0,
                 tx_counter,
+                error: None,
+                admission: None,
             },
         );
 
@@ -387,7 +653,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
             GroupTransferRouting::AllDomainsShardPeers => {
                 let dst_range = divide_evenly(request.dsts.len(), self.domains.len());
                 for ((domain_idx, domain), (beg, end)) in
-                    self.domains.iter_mut().enumerate().zip(dst_range.into_iter())
+                    self.domains.iter_mut().enumerate().zip(dst_range)
                 {
                     let src_desc = domain.get_mem_desc(request.src_mr.ptr)?;
                     let op = GroupWriteOp::Scatter(ScatterGroupWriteOp {
@@ -449,6 +715,8 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
                 num_used_domains: rdma_ops.len(),
                 cnt_domain_completion: 0,
                 tx_counter,
+                error: None,
+                admission: None,
             },
         );
 
@@ -468,10 +736,11 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         ptr: NonNull<c_void>,
         len: usize,
         addr: DomainAddress,
+        coalescible: bool,
     ) -> Result<()> {
         let domain = &mut self.domains[0];
         let desc = domain.get_mem_desc(mr.ptr)?;
-        domain.submit_send(transfer_id, addr, SendOp { ptr, len, desc });
+        domain.submit_send(transfer_id, addr, SendOp { ptr, len, desc, coalescible });
         Ok(())
     }
 
@@ -495,41 +764,38 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
         }
     }
 
-    /// Return Error if any domain fails the transfer.
+    /// Return Error after every submitted domain has retired, if any domain failed.
     /// Return Transfer if all domains have completed the transfer.
     /// Return Recv, Send, ImmData if any domain returns so.
     /// Return None otherwise.
     pub fn get_completion(&mut self) -> Option<DomainCompletionEntry> {
-        for domain in self.domains.iter_mut() {
-            if let Some(c) = domain.get_completion() {
+        for index in 0..N {
+            if let Some(c) = self.domains[index].get_completion() {
                 match c {
                     DomainCompletionEntry::Error(transfer_id, err) => {
-                        if let Some(write_op) = self.write_ops.remove(&transfer_id)
-                            && let Some(tx_counter) = write_op.tx_counter
-                        {
-                            tx_counter.error();
+                        if self.write_ops.contains_key(&transfer_id) {
+                            if let Some(completion) =
+                                self.retire_write(transfer_id, Some(err))
+                            {
+                                return Some(completion);
+                            }
+                        } else {
+                            return Some(DomainCompletionEntry::Error(
+                                transfer_id,
+                                err,
+                            ));
                         }
-                        return Some(DomainCompletionEntry::Error(transfer_id, err));
                     }
                     DomainCompletionEntry::Transfer(transfer_id) => {
-                        let Some(ctx) = self.write_ops.get_mut(&transfer_id) else {
-                            continue; // Transfer not found. Ignore.
-                        };
-                        ctx.cnt_domain_completion += 1;
-                        if ctx.num_used_domains == ctx.cnt_domain_completion {
-                            let ctx = self.write_ops.remove(&transfer_id).unwrap();
-                            if let Some(tx_counter) = ctx.tx_counter {
-                                tx_counter.done();
-                                return None;
-                            } else {
-                                return Some(DomainCompletionEntry::Transfer(
-                                    transfer_id,
-                                ));
-                            }
+                        if let Some(completion) = self.retire_write(transfer_id, None) {
+                            return Some(completion);
                         }
                     }
                     DomainCompletionEntry::ImmData(imm_data) => {
                         return Some(DomainCompletionEntry::ImmData(imm_data));
+                    }
+                    DomainCompletionEntry::Immediate(event) => {
+                        return Some(DomainCompletionEntry::Immediate(event));
                     }
                     DomainCompletionEntry::Recv { transfer_id, data_len } => {
                         return Some(DomainCompletionEntry::Recv {
@@ -547,6 +813,30 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
             }
         }
         None
+    }
+
+    fn retire_write(
+        &mut self,
+        id: TransferId,
+        error: Option<FabricLibError>,
+    ) -> Option<DomainCompletionEntry> {
+        let context = self.write_ops.get_mut(&id)?;
+        if !context.retire_domain(error) {
+            return None;
+        }
+        let context = self.write_ops.remove(&id).unwrap();
+        if let Some(counter) = context.tx_counter {
+            if context.error.is_some() {
+                counter.error();
+            } else {
+                counter.done();
+            }
+            None
+        } else if let Some(error) = context.error {
+            Some(DomainCompletionEntry::Error(id, error))
+        } else {
+            Some(DomainCompletionEntry::Transfer(id))
+        }
     }
 }
 
@@ -578,7 +868,7 @@ fn shard_single_transfer(
 ) -> SmallVec<(usize, usize)> {
     const MIN_SIZE: usize = 8192;
     let mut result = SmallVec::new();
-    let base = round_up(total_size / num_shards, MIN_SIZE);
+    let base = round_up(total_size.div_ceil(num_shards), MIN_SIZE);
     let mut offset = 0;
     for _ in 0..num_shards {
         let len = min(base, total_size - offset);
@@ -592,4 +882,37 @@ fn shard_single_transfer(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn first_domain_error_keeps_other_domain_resources_alive() {
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let mut context = WriteOpContext {
+            num_used_domains: 3,
+            cnt_domain_completion: 0,
+            tx_counter: None,
+            error: None,
+            admission: Some(resource),
+        };
+        assert!(
+            !context.retire_domain(Some(FabricLibError::Custom("first QP failed")))
+        );
+        assert!(weak.upgrade().is_some());
+        assert!(
+            !context.retire_domain(Some(FabricLibError::Custom("another QP failed")))
+        );
+        assert!(weak.upgrade().is_some());
+        assert!(context.retire_domain(None));
+        assert!(matches!(
+            context.error,
+            Some(FabricLibError::Custom("first QP failed"))
+        ));
+        drop(context);
+        assert!(weak.upgrade().is_none());
+    }
 }
