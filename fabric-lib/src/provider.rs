@@ -1,7 +1,10 @@
 use std::{borrow::Cow, ffi::c_void, ptr::NonNull, sync::Arc};
 
 use crate::{
-    api::{DomainAddress, MemoryRegionRemoteKey, PeerGroupHandle, TransferId},
+    api::{
+        DomainAddress, ImmediateEvent, MemoryRegionRemoteKey, PeerGroupHandle,
+        TransferId,
+    },
     error::{FabricLibError, Result},
     imm_count::ImmCountMap,
     mr::{MemoryRegion, MemoryRegionLocalDescriptor},
@@ -22,6 +25,11 @@ pub trait RdmaDomain {
 
     fn link_speed(&self) -> u64;
     fn addr(&self) -> DomainAddress;
+
+    /// Ordered, tail-signaled WR groups and source-identified immediate events.
+    fn supports_write_batch(&self) -> bool {
+        false
+    }
 
     fn register_mr_local(&mut self, region: &MemoryRegion) -> Result<()>;
     fn register_mr_allow_remote(
@@ -67,6 +75,7 @@ pub enum DomainCompletionEntry {
     Send(TransferId),
     Transfer(TransferId),
     ImmData(u32),
+    Immediate(ImmediateEvent),
     ImmCountReached(u32),
     Error(TransferId, FabricLibError),
 }

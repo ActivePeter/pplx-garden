@@ -33,10 +33,14 @@ use crate::{
 
 #[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
 pub enum WorkerCommand {
+    SubmitWriteBatches(
+        Vec<(TransferId, crate::api::WriteBatchRequest, Arc<dyn Send + Sync>)>,
+    ),
     SubmitTransfer {
         transfer_id: TransferId,
         request: TransferRequest,
         tx_counter: Option<TransferCounter>,
+        admission: Option<Arc<dyn Send + Sync>>,
     },
     SubmitSend {
         transfer_id: TransferId,
@@ -180,6 +184,7 @@ struct InitializedWorker {
     address_list: Vec<DomainAddress>,
     call_tx: crossbeam_channel::Sender<WorkerCall>,
     cmd_tx: crossbeam_channel::Sender<WorkerCommand>,
+    write_batches: bool,
 }
 
 struct InitializedUvmWatcher {
@@ -188,6 +193,7 @@ struct InitializedUvmWatcher {
 }
 
 pub struct WorkerHandle {
+    pub write_batches: bool,
     pub aggregated_link_speed: u64,
     pub address_list: Vec<DomainAddress>,
     pub worker_call_tx: crossbeam_channel::Sender<WorkerCall>,
@@ -195,9 +201,9 @@ pub struct WorkerHandle {
     pub cmd_tx: crossbeam_channel::Sender<WorkerCommand>,
     pub cq_rx: crossbeam_channel::Receiver<TransferCompletionEntry>,
     worker_stop_signal: Arc<AtomicBool>,
-    worker_handle: std::thread::JoinHandle<()>,
+    worker_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
     uvm_stop_signal: Arc<AtomicBool>,
-    uvm_handle: std::thread::JoinHandle<()>,
+    uvm_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl WorkerHandle {
@@ -207,8 +213,26 @@ impl WorkerHandle {
     }
 
     pub fn join(self) {
-        self.worker_handle.join().expect("Failed to join worker thread");
-        self.uvm_handle.join().expect("Failed to join UVM watcher thread");
+        self.join_stopped();
+    }
+
+    pub(crate) fn join_stopped(&self) {
+        // Keep the lock through join: a concurrent stop must not return while DMA is active.
+        for slot in [&self.worker_handle, &self.uvm_handle] {
+            let mut slot = slot.lock();
+            if let Some(handle) = slot.take()
+                && let Err(error) = handle.join()
+            {
+                warn!(?error, "fabric worker exited with a panic");
+            }
+        }
+    }
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        self.stop();
+        self.join_stopped();
     }
 }
 
@@ -367,6 +391,7 @@ impl InitializingWorker {
         };
 
         Ok(WorkerHandle {
+            write_batches: init_worker_args.write_batches,
             worker_stop_signal: init_worker_args.stop_signal,
             uvm_stop_signal: init_uvm_args.stop_signal,
             aggregated_link_speed: init_worker_args.aggregated_link_speed,
@@ -375,8 +400,8 @@ impl InitializingWorker {
             uvm_call_tx: init_uvm_args.call_tx,
             cmd_tx: init_worker_args.cmd_tx,
             cq_rx: self.cq_rx,
-            worker_handle: self.worker_handle,
-            uvm_handle: self.uvm_handle,
+            worker_handle: parking_lot::Mutex::new(Some(self.worker_handle)),
+            uvm_handle: parking_lot::Mutex::new(Some(self.uvm_handle)),
         })
     }
 }
@@ -494,6 +519,7 @@ fn rdma_worker_thread<D: RdmaDomain, const N: usize>(
     // Initialization complete
     let stop_signal = Arc::new(AtomicBool::new(false));
     let init = InitializedWorker {
+        write_batches: group.supports_write_batch(),
         stop_signal: stop_signal.clone(),
         aggregated_link_speed: group.aggregate_link_speed(),
         address_list,
@@ -569,9 +595,32 @@ fn worker_step<D: RdmaDomain, const N: usize>(
         };
         active = true;
         match cmd {
-            WorkerCommand::SubmitTransfer { transfer_id, request, tx_counter } => {
-                let result =
-                    group.submit_transfer_request(transfer_id, request, tx_counter);
+            WorkerCommand::SubmitWriteBatches(batches) => {
+                for (transfer_id, request, admission) in batches {
+                    if let Err(error) = group.submit_transfer_request_guarded(
+                        transfer_id,
+                        TransferRequest::WriteBatch(request),
+                        None,
+                        Some(admission),
+                    ) {
+                        cq_tx
+                            .send(TransferCompletionEntry::Error(transfer_id, error))
+                            .map_err(|_| ())?;
+                    }
+                }
+            }
+            WorkerCommand::SubmitTransfer {
+                transfer_id,
+                request,
+                tx_counter,
+                admission,
+            } => {
+                let result = group.submit_transfer_request_guarded(
+                    transfer_id,
+                    request,
+                    tx_counter,
+                    admission,
+                );
                 if let Err(e) = result {
                     let comp = TransferCompletionEntry::Error(transfer_id, e);
                     cq_tx.send(comp).map_err(|_| ())?;
@@ -630,6 +679,9 @@ fn worker_step<D: RdmaDomain, const N: usize>(
             }
             DomainCompletionEntry::ImmData(imm) => {
                 TransferCompletionEntry::ImmData(imm)
+            }
+            DomainCompletionEntry::Immediate(event) => {
+                TransferCompletionEntry::Immediate(event)
             }
             DomainCompletionEntry::ImmCountReached(imm) => {
                 TransferCompletionEntry::ImmCountReached(imm)

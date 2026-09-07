@@ -45,4 +45,5 @@ pub use transfer_engine_builder::TransferEngineBuilder;
 pub use verbs::{VerbsDeviceInfo, VerbsDeviceList};
 pub use worker::{InitializingWorker, PollingMode, Worker, WorkerHandle};
 
+#[cfg(test)]
 pub use interface::MockTestTransferEngine;

@@ -20,6 +20,10 @@ use crate::{
 };
 
 pub const MAX_GATHER_SEGMENTS: usize = 4;
+/// A bounded linked WR list: 255 payloads and up to two notification-ring segments.
+pub const MAX_WRITE_BATCH_WR: usize = 257;
+/// RC write queues per domain/peer; batch lanes include this innermost dimension.
+pub const WRITE_QP_LANES: usize = 2;
 
 pub type SmallVec<T> = ::smallvec::SmallVec<[T; 4]>;
 
@@ -165,6 +169,24 @@ pub struct GatherTransferRequest {
     pub domain: DomainGroupRouting,
 }
 
+/// A registered gather write in an explicitly routed batch.
+#[derive(Clone, Debug)]
+pub struct BatchWrite {
+    pub segments: SmallVec<GatherSegment>,
+    pub dst_mr: MemoryRegionDescriptor,
+    pub dst_offset: u64,
+    pub imm_data: Option<u32>,
+}
+
+/// A bounded sequence posted on one actual RC QP, with only the final WR signaled.
+/// `lane` selects (host worker, domain, QP), in that order. Unlike
+/// separate pinned requests, its writes cannot rotate between a domain's internal RC QPs.
+#[derive(Clone, Debug)]
+pub struct WriteBatchRequest {
+    pub lane: usize,
+    pub writes: Vec<BatchWrite>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PagedTransferRequest {
     pub length: u64,
@@ -208,6 +230,7 @@ pub enum TransferRequest {
     Imm(ImmTransferRequest),
     Single(SingleTransferRequest),
     Gather(GatherTransferRequest),
+    WriteBatch(WriteBatchRequest),
     Paged(PagedTransferRequest),
     Scatter(ScatterTransferRequest),
     Barrier(BarrierTransferRequest),
@@ -219,9 +242,21 @@ pub enum TransferCompletionEntry {
     Send(TransferId),
     Transfer(TransferId),
     ImmData(u32),
+    Immediate(ImmediateEvent),
     ImmCountReached(u32),
     UvmWatch { id: UvmWatcherId, old: u64, new: u64 },
     Error(TransferId, FabricLibError),
+}
+
+/// An immediate notification together with the connection that produced its CQE.
+/// QP numbers are local to a domain; applications must use the complete identity, not `value`
+/// or `qp_num` alone, to select remotely writable memory belonging to a peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImmediateEvent {
+    pub value: u32,
+    pub local: DomainAddress,
+    pub peer: DomainAddress,
+    pub qp_num: u32,
 }
 
 /// A free-range immediate counter exposed to users.

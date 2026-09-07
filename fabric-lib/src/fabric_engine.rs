@@ -44,6 +44,31 @@ pub struct FabricEngine {
 
 struct WorkerContext {
     worker: WorkerHandle,
+    admission: parking_lot::Mutex<()>,
+    write_budget: Vec<Arc<AtomicUsize>>,
+}
+
+// A conservative domain-wide SQ window (all peers and both QPs combined). Legacy RPC writes
+// charge the same counters; their pre-existing blocking admission is unchanged. A newly
+// reserved batch is queued before later legacy commands while holding the admission lock.
+const DOMAIN_WRITE_BUDGET: usize = 1024;
+struct WriteBudgetGuard(Vec<(Arc<AtomicUsize>, usize)>);
+impl Drop for WriteBudgetGuard {
+    fn drop(&mut self) {
+        for (used, count) in &self.0 {
+            used.fetch_sub(*count, SeqCst);
+        }
+    }
+}
+
+fn check_write_budget(used: usize, required: usize) -> Result<()> {
+    if required > DOMAIN_WRITE_BUDGET {
+        return Err(FabricLibError::Custom("batch exceeds domain SQ budget"));
+    }
+    if used.saturating_add(required) > DOMAIN_WRITE_BUDGET {
+        return Err(FabricLibError::Full);
+    }
+    Ok(())
 }
 
 impl FabricEngine {
@@ -80,6 +105,15 @@ impl FabricEngine {
             .collect::<Result<Vec<_>>>()?;
 
         let main_worker = &initialized_workers.first().unwrap().1;
+        if host_striped
+            && initialized_workers.iter().any(|(_, worker)| {
+                worker.address_list.len() != main_worker.address_list.len()
+            })
+        {
+            return Err(FabricLibError::Custom(
+                "striped host workers must have the same domain topology",
+            ));
+        }
         let main_address = main_worker.address_list[0].clone();
         let nets_per_gpu =
             unsafe { NonZeroU8::new_unchecked(main_worker.address_list.len() as u8) };
@@ -92,7 +126,17 @@ impl FabricEngine {
             num_groups += 1;
             num_domains += w.address_list.len();
             aggregated_link_speed += w.aggregated_link_speed;
-            contexts.insert(device, WorkerContext { worker: w });
+            let write_budget = (0..w.address_list.len())
+                .map(|_| Arc::new(AtomicUsize::new(0)))
+                .collect();
+            contexts.insert(
+                device,
+                WorkerContext {
+                    worker: w,
+                    admission: parking_lot::Mutex::new(()),
+                    write_budget,
+                },
+            );
         }
 
         Ok(Self {
@@ -142,6 +186,161 @@ impl FabricEngine {
         self.workers.len()
     }
 
+    pub fn host_write_lane_count(&self) -> usize {
+        (if self.host_striped {
+            self.num_domains
+        } else {
+            self.nets_per_gpu.get() as usize
+        }) * crate::api::WRITE_QP_LANES
+    }
+
+    pub fn supports_write_batches(&self) -> bool {
+        self.workers.values().all(|worker| worker.worker.write_batches)
+    }
+
+    /// Reserves a command slot on every participating worker before publishing any group.
+    /// Returned per-transfer errors occur after admission and must be completed, never replayed.
+    pub fn try_submit_write_batches(
+        &self,
+        batches: Vec<(TransferId, crate::api::WriteBatchRequest)>,
+    ) -> Result<Vec<(TransferId, FabricLibError)>> {
+        if self.is_stopped() {
+            return Err(FabricLibError::Custom("engine is stopped"));
+        }
+        let mut routed = BTreeMap::<usize, Vec<_>>::new();
+        for (id, batch) in batches {
+            let (index, batch) = self.prepare_write_batch(batch)?;
+            routed.entry(index).or_default().push((id, batch));
+        }
+        let mut guards = Vec::with_capacity(routed.len());
+        for &index in routed.keys() {
+            let worker = self.get_worker_by_index(index)?;
+            guards.push(worker.admission.try_lock().ok_or(FabricLibError::Full)?);
+            if worker.worker.cmd_tx.is_full() {
+                return Err(FabricLibError::Full);
+            }
+            let mut required = vec![0usize; worker.write_budget.len()];
+            for (_, batch) in &routed[&index] {
+                required[batch.lane / crate::api::WRITE_QP_LANES] += batch.writes.len();
+            }
+            for (used, count) in worker.write_budget.iter().zip(required) {
+                check_write_budget(used.load(SeqCst), count)?;
+            }
+        }
+        let mut failures = Vec::new();
+        for (index, batches) in routed {
+            let worker = self.get_worker_by_index(index)?;
+            let batches = batches
+                .into_iter()
+                .map(|(id, batch)| {
+                    let used = worker.write_budget
+                        [batch.lane / crate::api::WRITE_QP_LANES]
+                        .clone();
+                    let count = batch.writes.len();
+                    used.fetch_add(count, SeqCst);
+                    let guard: Arc<dyn Send + Sync> =
+                        Arc::new(WriteBudgetGuard(vec![(used, count)]));
+                    (id, batch, guard)
+                })
+                .collect();
+            // All writers take admission; the consumer can only create more space. Disconnection
+            // is the only possible failure after reservation and is a terminal admitted result.
+            if let Err(error) = worker
+                .worker
+                .cmd_tx
+                .try_send(WorkerCommand::SubmitWriteBatches(batches))
+            {
+                let WorkerCommand::SubmitWriteBatches(batches) = error.into_inner()
+                else {
+                    unreachable!()
+                };
+                failures.extend(batches.into_iter().map(|(id, _, _)| {
+                    (id, FabricLibError::Custom("worker stopped after batch admission"))
+                }));
+            }
+        }
+        Ok(failures)
+    }
+
+    fn prepare_write_batch(
+        &self,
+        mut batch: crate::api::WriteBatchRequest,
+    ) -> Result<(usize, crate::api::WriteBatchRequest)> {
+        if batch.writes.is_empty()
+            || batch.writes.len() > crate::api::MAX_WRITE_BATCH_WR
+            || batch.lane >= self.host_write_lane_count()
+            || !self.supports_write_batches()
+        {
+            return Err(FabricLibError::Custom("invalid or unsupported write batch"));
+        }
+        let domains = self.nets_per_gpu.get() as usize;
+        let (index, lane) = if self.host_striped {
+            (
+                batch.lane / (domains * crate::api::WRITE_QP_LANES),
+                batch.lane % (domains * crate::api::WRITE_QP_LANES),
+            )
+        } else {
+            (0, batch.lane)
+        };
+        let mut destination = None;
+        for write in &mut batch.writes {
+            if (write.segments.is_empty() && write.imm_data.is_none())
+                || write.segments.len() > crate::api::MAX_GATHER_SEGMENTS
+            {
+                return Err(FabricLibError::Custom("invalid write batch SGE count"));
+            }
+            let mut length = 0u64;
+            for source in &write.segments {
+                if self.device_for_mr(source.src_mr)? != Device::Host
+                    || source.length == 0
+                {
+                    return Err(FabricLibError::Custom(
+                        "write batches require nonempty host-memory segments",
+                    ));
+                }
+                length = length
+                    .checked_add(source.length)
+                    .filter(|&len| len <= u32::MAX as u64)
+                    .ok_or(FabricLibError::Custom(
+                        "write batch SGE length exceeds u32",
+                    ))?;
+                (source.src_mr.ptr.as_ptr() as u64)
+                    .checked_add(source.src_offset)
+                    .and_then(|start| start.checked_add(source.length))
+                    .ok_or(FabricLibError::Custom("write batch source overflow"))?;
+            }
+            if self.host_striped {
+                narrow_host_descriptor(
+                    &mut write.dst_mr,
+                    index,
+                    self.workers.len(),
+                    domains,
+                )?;
+            }
+            if write.dst_mr.addr_rkey_list.len() != domains {
+                return Err(FabricLibError::Custom(
+                    "write batch domain topology mismatch",
+                ));
+            }
+            let address =
+                &write.dst_mr.addr_rkey_list[lane / crate::api::WRITE_QP_LANES].0;
+            if destination.as_ref().is_some_and(|old| old != address) {
+                return Err(FabricLibError::Custom(
+                    "one write batch cannot target different peers",
+                ));
+            }
+            destination = Some(address.clone());
+            write
+                .dst_mr
+                .ptr
+                .checked_add(write.dst_offset)
+                .and_then(|start| start.checked_add(length))
+                .ok_or(FabricLibError::Custom("write batch destination overflow"))?;
+        }
+        batch.lane = lane;
+        Ok((index, batch))
+    }
+
     pub fn register_memory_local(
         &self,
         ptr: NonNull<c_void>,
@@ -188,10 +387,11 @@ impl FabricEngine {
                     ));
                 }
                 if descriptor.ptr != ptr.as_ptr() as u64
-                    || descriptor.addr_rkey_list.len() != 1
+                    || descriptor.addr_rkey_list.len()
+                        != worker.worker.address_list.len()
                 {
                     return Err(FabricLibError::Custom(
-                        "striped host workers require one domain per worker",
+                        "striped host worker returned an inconsistent domain descriptor",
                     ));
                 }
                 handle = Some(registered);
@@ -306,6 +506,7 @@ impl FabricEngine {
         self.submit_send_on(0, transfer_id, addr, mr, ptr, len, coalescible)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_send_on(
         &self,
         worker_index: usize,
@@ -352,7 +553,56 @@ impl FabricEngine {
         mut request: TransferRequest,
         tx_counter: Option<TransferCounter>,
     ) -> Result<()> {
+        if let TransferRequest::WriteBatch(mut batch) = request {
+            if batch.writes.is_empty()
+                || batch.writes.len() > crate::api::MAX_WRITE_BATCH_WR
+            {
+                return Err(FabricLibError::Custom("invalid write batch length"));
+            }
+            for write in &batch.writes {
+                for source in &write.segments {
+                    if self.device_for_mr(source.src_mr)? != Device::Host {
+                        return Err(FabricLibError::Custom(
+                            "write batches currently require host memory",
+                        ));
+                    }
+                }
+            }
+            let worker = if self.host_striped {
+                let domains = self.nets_per_gpu.get() as usize;
+                let (index, domain) = host_write_lane(
+                    batch.lane / crate::api::WRITE_QP_LANES,
+                    self.workers.len(),
+                    domains,
+                )?;
+                let worker = self.workers.values().nth(index).ok_or(
+                    FabricLibError::Custom("write batch lane is out of bounds"),
+                )?;
+                for write in &mut batch.writes {
+                    narrow_host_descriptor(
+                        &mut write.dst_mr,
+                        index,
+                        self.workers.len(),
+                        domains,
+                    )?;
+                }
+                batch.lane = domain * crate::api::WRITE_QP_LANES
+                    + batch.lane % crate::api::WRITE_QP_LANES;
+                worker
+            } else {
+                self.get_worker(&Device::Host)?
+            };
+            return worker.send_command(WorkerCommand::SubmitTransfer {
+                transfer_id,
+                request: TransferRequest::WriteBatch(batch),
+                tx_counter,
+                admission: None,
+            });
+        }
         let source_device = match &request {
+            TransferRequest::WriteBatch(_) => {
+                unreachable!("write batches use explicit lanes")
+            }
             TransferRequest::Imm(_) | TransferRequest::Barrier(_) => None,
             TransferRequest::Single(req) => Some(self.device_for_mr(req.src_mr)?),
             TransferRequest::Gather(req) => {
@@ -380,7 +630,12 @@ impl FabricEngine {
             } else {
                 0
             };
-            narrow_host_transfer_request(&mut request, index, self.workers.len())?;
+            narrow_host_transfer_request(
+                &mut request,
+                index,
+                self.workers.len(),
+                self.nets_per_gpu.get() as usize,
+            )?;
             self.workers
                 .values()
                 .nth(index)
@@ -395,6 +650,7 @@ impl FabricEngine {
             transfer_id,
             request,
             tx_counter,
+            admission: None,
         })
     }
 
@@ -418,8 +674,12 @@ impl FabricEngine {
 
     pub fn stop(&self) {
         self.stop_signal.store(true, SeqCst);
-        for (_, ctx) in self.workers.iter() {
+        for ctx in self.workers.values() {
             ctx.worker.stop();
+        }
+        // Joining destroys every domain/QP before callers may release DMA source owners.
+        for ctx in self.workers.values() {
+            ctx.worker.join_stopped();
         }
     }
 
@@ -460,45 +720,90 @@ fn narrow_host_descriptor(
     descriptor: &mut MemoryRegionDescriptor,
     worker_index: usize,
     worker_count: usize,
+    domains_per_worker: usize,
 ) -> Result<()> {
-    if descriptor.addr_rkey_list.len() != worker_count {
+    if worker_index >= worker_count
+        || domains_per_worker == 0
+        || Some(descriptor.addr_rkey_list.len())
+            != worker_count.checked_mul(domains_per_worker)
+    {
         return Err(FabricLibError::Custom(
-            "Remote memory descriptor does not match striped host worker count",
+            "Remote memory descriptor does not match striped host worker/domain topology",
         ));
     }
-    let selected = descriptor.addr_rkey_list[worker_index].clone();
-    descriptor.addr_rkey_list.clear();
-    descriptor.addr_rkey_list.push(selected);
+    let start = worker_index * domains_per_worker;
+    descriptor.addr_rkey_list = descriptor.addr_rkey_list
+        [start..start + domains_per_worker]
+        .iter()
+        .cloned()
+        .collect();
     Ok(())
+}
+
+fn host_write_lane(
+    lane: usize,
+    workers: usize,
+    domains: usize,
+) -> Result<(usize, usize)> {
+    if domains == 0 || workers.checked_mul(domains).is_none_or(|count| lane >= count) {
+        return Err(FabricLibError::Custom("write batch lane is out of bounds"));
+    }
+    Ok((lane / domains, lane % domains))
 }
 
 fn narrow_host_transfer_request(
     request: &mut TransferRequest,
     worker_index: usize,
     worker_count: usize,
+    domains_per_worker: usize,
 ) -> Result<()> {
     match request {
-        TransferRequest::Imm(request) => {
-            narrow_host_descriptor(&mut request.dst_mr, worker_index, worker_count)
+        TransferRequest::WriteBatch(_) => {
+            unreachable!("write batches use explicit lanes")
         }
+        TransferRequest::Imm(request) => narrow_host_descriptor(
+            &mut request.dst_mr,
+            worker_index,
+            worker_count,
+            domains_per_worker,
+        ),
         TransferRequest::Barrier(request) => {
             for descriptor in &mut request.dst_mrs {
-                narrow_host_descriptor(descriptor, worker_index, worker_count)?;
+                narrow_host_descriptor(
+                    descriptor,
+                    worker_index,
+                    worker_count,
+                    domains_per_worker,
+                )?;
             }
             Ok(())
         }
-        TransferRequest::Single(request) => {
-            narrow_host_descriptor(&mut request.dst_mr, worker_index, worker_count)
-        }
-        TransferRequest::Gather(request) => {
-            narrow_host_descriptor(&mut request.dst_mr, worker_index, worker_count)
-        }
-        TransferRequest::Paged(request) => {
-            narrow_host_descriptor(&mut request.dst_mr, worker_index, worker_count)
-        }
+        TransferRequest::Single(request) => narrow_host_descriptor(
+            &mut request.dst_mr,
+            worker_index,
+            worker_count,
+            domains_per_worker,
+        ),
+        TransferRequest::Gather(request) => narrow_host_descriptor(
+            &mut request.dst_mr,
+            worker_index,
+            worker_count,
+            domains_per_worker,
+        ),
+        TransferRequest::Paged(request) => narrow_host_descriptor(
+            &mut request.dst_mr,
+            worker_index,
+            worker_count,
+            domains_per_worker,
+        ),
         TransferRequest::Scatter(request) => {
             for target in Arc::make_mut(&mut request.dsts) {
-                narrow_host_descriptor(&mut target.dst_mr, worker_index, worker_count)?;
+                narrow_host_descriptor(
+                    &mut target.dst_mr,
+                    worker_index,
+                    worker_count,
+                    domains_per_worker,
+                )?;
             }
             Ok(())
         }
@@ -548,11 +853,111 @@ impl WorkerContext {
         rx.recv().map_err(|_| FabricLibError::Custom("Worker is down"))
     }
 
-    pub fn send_command(&self, cmd: WorkerCommand) -> Result<()> {
+    pub fn send_command(&self, mut cmd: WorkerCommand) -> Result<()> {
+        let _admission = self.admission.lock();
+        if let WorkerCommand::SubmitTransfer { request, admission, .. } = &mut cmd {
+            use crate::api::DomainGroupRouting;
+            let (route, count) = match request {
+                TransferRequest::Single(request) => (Some(request.domain), 1),
+                TransferRequest::Gather(request) => (Some(request.domain), 1),
+                TransferRequest::Imm(request) => (Some(request.domain), 1),
+                TransferRequest::Barrier(request) => {
+                    (Some(request.domain), request.dst_mrs.len())
+                }
+                TransferRequest::WriteBatch(batch) => (
+                    Some(DomainGroupRouting::Pinned {
+                        domain_idx: (batch.lane / crate::api::WRITE_QP_LANES) as u8,
+                    }),
+                    batch.writes.len(),
+                ),
+                // Paged/scatter use conservative domain-wide upper bounds as well.
+                TransferRequest::Paged(request) => {
+                    (None, request.src_page_indices.len().saturating_add(1))
+                }
+                // Scatter posts one WRITE (optionally WITH_IMM) per target/domain.
+                TransferRequest::Scatter(request) => (None, request.dsts.len()),
+            };
+            let slots = self
+                .write_budget
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| match route {
+                    Some(DomainGroupRouting::Pinned { domain_idx }) => {
+                        *index == domain_idx as usize
+                    }
+                    _ => true,
+                })
+                .map(|(_, used)| {
+                    used.fetch_add(count, SeqCst);
+                    (used.clone(), count)
+                })
+                .collect();
+            *admission = Some(Arc::new(WriteBudgetGuard(slots)));
+        }
         self.worker
             .cmd_tx
             .send(cmd)
             .map_err(|_| FabricLibError::Custom("Worker is down"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod host_lane_tests {
+    use super::*;
+    use crate::api::MemoryRegionRemoteKey;
+
+    #[test]
+    fn domain_budget_distinguishes_invalid_from_temporary_full_and_reclaims_once() {
+        assert!(check_write_budget(0, DOMAIN_WRITE_BUDGET).is_ok());
+        assert!(matches!(
+            check_write_budget(1, DOMAIN_WRITE_BUDGET),
+            Err(FabricLibError::Full)
+        ));
+        assert!(matches!(check_write_budget(usize::MAX, 1), Err(FabricLibError::Full)));
+        assert!(matches!(
+            check_write_budget(0, DOMAIN_WRITE_BUDGET + 1),
+            Err(FabricLibError::Custom(_))
+        ));
+        let used = Arc::new(AtomicUsize::new(7));
+        let guard = Arc::new(WriteBudgetGuard(vec![(used.clone(), 7)]));
+        let in_flight = guard.clone();
+        drop(guard);
+        assert_eq!(used.load(SeqCst), 7);
+        drop(in_flight);
+        assert_eq!(used.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn every_worker_and_hca_is_addressable() {
+        let descriptor = MemoryRegionDescriptor {
+            ptr: 4096,
+            addr_rkey_list: (0..6)
+                .map(|i| {
+                    (DomainAddress(vec![i].into()), MemoryRegionRemoteKey(i as u64))
+                })
+                .collect(),
+        };
+        for lane in 0..6 {
+            let (worker, domain) = host_write_lane(lane, 3, 2).unwrap();
+            let mut narrowed = descriptor.clone();
+            narrow_host_descriptor(&mut narrowed, worker, 3, 2).unwrap();
+            assert_eq!(narrowed.addr_rkey_list.len(), 2);
+            assert_eq!(
+                narrowed.addr_rkey_list[domain],
+                descriptor.addr_rkey_list[lane]
+            );
+        }
+        assert!(host_write_lane(6, 3, 2).is_err());
+        assert!(host_write_lane(0, 3, 0).is_err());
+        assert!(narrow_host_descriptor(&mut descriptor.clone(), 0, 3, 1).is_err());
+        assert!(narrow_host_descriptor(&mut descriptor.clone(), 3, 3, 2).is_err());
+    }
+
+    #[test]
+    fn single_hca_layout_is_unchanged() {
+        for lane in 0..4 {
+            assert_eq!(host_write_lane(lane, 4, 1).unwrap(), (lane, 0));
+        }
     }
 }

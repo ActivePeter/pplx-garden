@@ -1,3 +1,4 @@
+#[cfg(test)]
 use mockall::{automock, mock};
 
 use std::{
@@ -78,7 +79,7 @@ pub type BouncingRecvCallback = Arc<Box<dyn Fn(&[u8]) -> CallbackResult + Send +
 pub type BouncingErrorCallback =
     Arc<Box<dyn Fn(FabricLibError) -> CallbackResult + Send + Sync>>;
 
-#[automock]
+#[cfg_attr(test, automock)]
 pub trait SendRecvEngine {
     fn submit_send(
         &self,
@@ -105,7 +106,7 @@ pub trait SendRecvEngine {
     ) -> Result<()>;
 }
 
-#[automock]
+#[cfg_attr(test, automock)]
 pub trait AsyncTransferEngine {
     fn wait_for_imm_count(
         &self,
@@ -125,6 +126,7 @@ pub trait AsyncTransferEngine {
     ) -> impl Future<Output = Result<()>> + Send + Sync;
 }
 
+#[cfg(test)]
 mock! {
     pub TestTransferEngine {}
 

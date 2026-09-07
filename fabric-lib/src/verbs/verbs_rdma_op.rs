@@ -390,6 +390,7 @@ fn opcode_imm(imm_data: Option<u32>) -> (u32, u32) {
 }
 
 pub enum WriteOpIter {
+    Batch(super::verbs_batch::BatchWriteOpIter),
     Single(SingleWriteOpIter),
     Gather(GatherWriteOpIter),
     Paged(PagedWriteOpIter),
@@ -399,6 +400,7 @@ pub enum WriteOpIter {
 impl WriteOpIter {
     pub fn total_ops(&self) -> usize {
         match self {
+            WriteOpIter::Batch(iter) => iter.total_ops(),
             WriteOpIter::Single(_) => 1,
             WriteOpIter::Gather(_) => 1,
             WriteOpIter::Paged(iter) => iter.total_ops(),
@@ -408,6 +410,7 @@ impl WriteOpIter {
 
     pub fn peek(&self) -> (*mut ibv_qp, *mut ibv_send_wr, usize) {
         match self {
+            WriteOpIter::Batch(iter) => iter.peek(),
             WriteOpIter::Single(iter) => iter.peek(),
             WriteOpIter::Gather(iter) => iter.peek(),
             WriteOpIter::Paged(iter) => iter.peek(),
@@ -420,6 +423,7 @@ impl WriteOpIter {
             return;
         }
         match self {
+            WriteOpIter::Batch(iter) => iter.advance(n),
             WriteOpIter::Single(iter) => {
                 assert!(n == 1);
                 iter.mark_done();

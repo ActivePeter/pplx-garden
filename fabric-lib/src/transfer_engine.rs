@@ -5,7 +5,7 @@ use std::{
     num::NonZeroU32,
     ptr::NonNull,
     sync::Arc,
-    sync::atomic::{AtomicI64, AtomicU64, Ordering::SeqCst},
+    sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::SeqCst},
     thread::JoinHandle,
 };
 
@@ -60,6 +60,8 @@ unsafe impl Send for RecvContext {}
 unsafe impl Sync for RecvContext {}
 
 pub type ImmCallbackFn = Box<dyn Fn(u32) -> CallbackResult + Send + Sync>;
+pub type ImmediateCallbackFn =
+    Box<dyn Fn(&crate::api::ImmediateEvent) -> CallbackResult + Send + Sync>;
 pub type UvmWatcherCallback =
     Box<dyn Fn(u64, u64) -> std::result::Result<bool, String> + Send + Sync>;
 
@@ -73,8 +75,10 @@ enum ImmCountFn {
     /// The callback will be called every time the expected count is reached.
     Repeated(Box<dyn Fn() -> std::result::Result<bool, String> + Send + Sync>),
 }
+#[derive(Default)]
 struct Callbacks {
     imm: RwLock<Vec<ImmCallbackFn>>,
+    immediate: RwLock<Vec<ImmediateCallbackFn>>,
     recv_ops: DashMap<TransferId, RecvContext>,
     send_ops: DashMap<TransferId, SendCallback>,
     transfer_ops: DashMap<TransferId, TransferCallbackEntry>,
@@ -87,6 +91,7 @@ pub struct TransferEngine {
     engine: Arc<FabricEngine>,
     callbacks: Arc<Callbacks>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    stopping: AtomicBool,
 }
 
 enum CompletionCpuPolicy {
@@ -146,14 +151,7 @@ impl TransferEngine {
             FabricEngine::new(workers)?
         });
 
-        let callbacks = Arc::new(Callbacks {
-            imm: RwLock::new(Vec::new()),
-            recv_ops: DashMap::new(),
-            send_ops: DashMap::new(),
-            transfer_ops: DashMap::new(),
-            imm_count: DashMap::new(),
-            watchers: DashMap::new(),
-        });
+        let callbacks = Arc::new(Callbacks::default());
 
         let callback_workers = if host_striped { engine.worker_count() } else { 1 };
         let mut threads: Vec<JoinHandle<()>> = Vec::with_capacity(callback_workers);
@@ -214,6 +212,7 @@ impl TransferEngine {
             engine,
             callbacks,
             threads: Mutex::new(threads),
+            stopping: AtomicBool::new(false),
         })
     }
 
@@ -237,8 +236,61 @@ impl TransferEngine {
         self.engine.worker_count()
     }
 
+    /// Number of explicit host-memory write lanes, including independent context replicas.
+    pub fn host_write_lane_count(&self) -> usize {
+        self.engine.host_write_lane_count()
+    }
+
+    pub fn supports_write_batches(&self) -> bool {
+        self.engine.supports_write_batches()
+    }
+
+    /// Nonblocking all-worker admission. Each batch stays on one actual QP and gets one local
+    /// completion. Full returns before publishing any command and invokes none of the callbacks.
+    pub fn try_submit_write_batches(
+        &self,
+        batches: Vec<(crate::api::WriteBatchRequest, TransferResultCallback)>,
+    ) -> Result<()> {
+        let mut ids = Vec::with_capacity(batches.len());
+        let requests = batches
+            .into_iter()
+            .map(|(batch, callback)| {
+                let id = self.assign_transfer_id();
+                self.callbacks
+                    .transfer_ops
+                    .insert(id, TransferCallbackEntry::Result(callback));
+                ids.push(id);
+                (id, batch)
+            })
+            .collect();
+        match self.engine.try_submit_write_batches(requests) {
+            Ok(failures) => {
+                for (id, error) in failures {
+                    if let Some((_, TransferCallbackEntry::Result(callback))) =
+                        self.callbacks.transfer_ops.remove(&id)
+                    {
+                        let _ = callback(Err(error));
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => {
+                for id in ids {
+                    self.callbacks.transfer_ops.remove(&id);
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn add_imm_callback(&self, callback: ImmCallbackFn) {
         self.callbacks.imm.write().push(callback);
+    }
+
+    /// Registers a callback for providers that retain CQE connection identity (currently verbs).
+    /// Legacy immediate callbacks still receive the value, preserving existing counter users.
+    pub fn add_immediate_callback(&self, callback: ImmediateCallbackFn) {
+        self.callbacks.immediate.write().push(callback);
     }
 
     pub fn set_imm_count_expected(
@@ -348,12 +400,22 @@ impl TransferEngine {
     }
 
     pub fn stop(&self) {
+        let first = !self.stopping.swap(true, SeqCst);
         self.engine.stop();
+        if !first {
+            return;
+        }
         let threads = std::mem::take(&mut *self.threads.lock());
-        for thread in threads {
-            if let Err(error) = thread.join() {
-                error!(?error, "Failed to join a Transfer Engine callback thread.");
-            }
+        let callbacks = self.callbacks.clone();
+        if threads
+            .iter()
+            .any(|thread| thread.thread().id() == std::thread::current().id())
+        {
+            // A callback may stop its own engine. Join/clear on a reaper so the callback can
+            // return and release any callback-table read guards before teardown.
+            std::thread::spawn(move || finish_stop(threads, &callbacks));
+        } else {
+            finish_stop(threads, &callbacks);
         }
     }
 
@@ -650,6 +712,45 @@ impl AsyncTransferEngine for TransferEngine {
     }
 }
 
+fn finish_stop(threads: Vec<JoinHandle<()>>, callbacks: &Callbacks) {
+    for thread in threads {
+        if let Err(error) = thread.join() {
+            error!(?error, "Failed to join a Transfer Engine callback thread.");
+        }
+    }
+    // The fabric workers have already exited and destroyed their QPs. Even a partially
+    // submitted unsignaled prefix can no longer DMA, so it is now safe to retire its owners.
+    let ids: Vec<_> = callbacks.transfer_ops.iter().map(|entry| *entry.key()).collect();
+    for id in ids {
+        if let Some((_, callback)) = callbacks.transfer_ops.remove(&id) {
+            let error =
+                FabricLibError::Custom("engine stopped before transfer completion");
+            let result = match callback {
+                TransferCallbackEntry::Split(callback) => (callback.on_error)(error),
+                TransferCallbackEntry::Result(callback) => callback(Err(error)),
+            };
+            if let Err(error) = result {
+                warn!(%error, "transfer shutdown callback failed");
+            }
+        }
+    }
+    let ids: Vec<_> = callbacks.send_ops.iter().map(|entry| *entry.key()).collect();
+    for id in ids {
+        if let Some((_, callback)) = callbacks.send_ops.remove(&id)
+            && let Err(error) = callback(Err(FabricLibError::Custom(
+                "engine stopped before SEND completion",
+            )))
+        {
+            warn!(%error, "SEND shutdown callback failed");
+        }
+    }
+    callbacks.recv_ops.clear();
+    callbacks.imm_count.clear();
+    callbacks.watchers.clear();
+    callbacks.imm.write().clear();
+    callbacks.immediate.write().clear();
+}
+
 fn callback_worker_thread(
     engine: Arc<FabricEngine>,
     states: Arc<Callbacks>,
@@ -726,6 +827,15 @@ fn handle_transfer_completion(
         TransferCompletionEntry::ImmData(imm_data) => {
             for callback in states.imm.read().iter() {
                 callback(imm_data)?
+            }
+            Ok(())
+        }
+        TransferCompletionEntry::Immediate(event) => {
+            for callback in states.imm.read().iter() {
+                callback(event.value)?;
+            }
+            for callback in states.immediate.read().iter() {
+                callback(&event)?;
             }
             Ok(())
         }
@@ -824,5 +934,45 @@ fn handle_transfer_completion(
             };
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Source(Arc<AtomicUsize>);
+    impl Drop for Source {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, SeqCst);
+        }
+    }
+
+    #[test]
+    fn shutdown_joins_before_retiring_pending_sources_and_completes_once() {
+        let callbacks = Callbacks::default();
+        let released = Arc::new(AtomicUsize::new(0));
+        let errors = Arc::new(AtomicUsize::new(0));
+        let observed = errors.clone();
+        let source = Source(released.clone());
+        callbacks.transfer_ops.insert(
+            TransferId(7),
+            TransferCallbackEntry::Result(Box::new(move |result| {
+                let _source = source;
+                assert!(result.is_err());
+                observed.fetch_add(1, SeqCst);
+                Ok(())
+            })),
+        );
+        let before_join = released.clone();
+        let thread = std::thread::spawn(move || {
+            assert_eq!(before_join.load(SeqCst), 0);
+        });
+        finish_stop(vec![thread], &callbacks);
+        assert_eq!(released.load(SeqCst), 1);
+        assert_eq!(errors.load(SeqCst), 1);
+        finish_stop(Vec::new(), &callbacks);
+        assert_eq!(errors.load(SeqCst), 1);
     }
 }

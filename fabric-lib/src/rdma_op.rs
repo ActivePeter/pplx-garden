@@ -58,6 +58,7 @@ pub struct PagedWriteOp {
 pub enum WriteOp {
     Single(SingleWriteOp),
     Gather(GatherWriteOp),
+    Batch { qp_lane: usize, writes: Vec<GatherWriteOp> },
     Imm(ImmWriteOp),
     Paged(PagedWriteOp),
 }

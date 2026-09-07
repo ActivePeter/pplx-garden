@@ -112,6 +112,7 @@ pub struct RCQueuePair {
 }
 
 impl RCQueuePair {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cq: NonNull<ibv_cq>,
         pd: NonNull<ibv_pd>,

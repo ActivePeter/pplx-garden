@@ -30,7 +30,9 @@ smallvec = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 syscalls = { workspace = true }
-mockall = { workspace = true }
 
 # Optional dependencies
 tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+mockall = { workspace = true }

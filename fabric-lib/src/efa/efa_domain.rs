@@ -796,6 +796,13 @@ impl RdmaDomain for EfaDomain {
         dest_addr: DomainAddress,
         op: WriteOp,
     ) {
+        if matches!(&op, WriteOp::Batch { .. }) {
+            self.completions.push_back(DomainCompletionEntry::Error(
+                transfer_id,
+                FabricLibError::Custom("EFA does not support ordered write batches"),
+            ));
+            return;
+        }
         // Resolve the remote address
         let Ok(dest_fi_addr) = self.get_or_add_remote_addr(&dest_addr) else {
             self.completions.push_back(DomainCompletionEntry::Error(
@@ -809,6 +816,9 @@ impl RdmaDomain for EfaDomain {
         };
 
         self.do_submit_write(transfer_id, |rawctx, msg_buf| match op {
+            WriteOp::Batch { .. } => {
+                unreachable!("unsupported batch rejected before submission")
+            }
             WriteOp::Single(op) => WriteOpIter::Single(SingleWriteOpIter::new_single(
                 op,
                 dest_fi_addr,

@@ -10,6 +10,8 @@ pub type Result<T> = std::result::Result<T, FabricLibError>;
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum FabricLibError {
+    #[error("bounded transfer admission is full; no work was submitted")]
+    Full,
     #[cfg(feature = "efa")]
     #[error("{0}")]
     Libfabric(#[from] LibfabricError),
