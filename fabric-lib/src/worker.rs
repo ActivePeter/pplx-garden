@@ -179,6 +179,7 @@ pub struct InitializingWorker {
 }
 
 struct InitializedWorker {
+    connection_admission: Arc<AtomicBool>,
     stop_signal: Arc<AtomicBool>,
     aggregated_link_speed: u64,
     address_list: Vec<DomainAddress>,
@@ -193,6 +194,7 @@ struct InitializedUvmWatcher {
 }
 
 pub struct WorkerHandle {
+    pub(crate) connection_admission: Arc<AtomicBool>,
     pub write_batches: bool,
     pub aggregated_link_speed: u64,
     pub address_list: Vec<DomainAddress>,
@@ -391,6 +393,7 @@ impl InitializingWorker {
         };
 
         Ok(WorkerHandle {
+            connection_admission: init_worker_args.connection_admission,
             write_batches: init_worker_args.write_batches,
             worker_stop_signal: init_worker_args.stop_signal,
             uvm_stop_signal: init_uvm_args.stop_signal,
@@ -488,10 +491,12 @@ fn rdma_worker_thread<D: RdmaDomain, const N: usize>(
     //
     // NOTE(lequn): We'd like to create the domain after pinning the CPU so that
     // the allocated resources are on the correct NUMA node.
+    let connection_admission = Arc::new(AtomicBool::new(true));
     let mut domains = Vec::with_capacity(N);
     for info in domain_list.into_iter() {
         match D::open(info, imm_count_map.clone()) {
-            Ok(domain) => {
+            Ok(mut domain) => {
+                domain.set_connection_admission(connection_admission.clone());
                 domains.push(domain);
             }
             Err(e) => {
@@ -519,6 +524,7 @@ fn rdma_worker_thread<D: RdmaDomain, const N: usize>(
     // Initialization complete
     let stop_signal = Arc::new(AtomicBool::new(false));
     let init = InitializedWorker {
+        connection_admission,
         write_batches: group.supports_write_batch(),
         stop_signal: stop_signal.clone(),
         aggregated_link_speed: group.aggregate_link_speed(),

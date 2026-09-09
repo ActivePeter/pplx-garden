@@ -26,6 +26,9 @@ pub trait RdmaDomain {
     fn link_speed(&self) -> u64;
     fn addr(&self) -> DomainAddress;
 
+    /// Cold-path gate shared with the engine. Established resources remain usable while false.
+    fn set_connection_admission(&mut self, _enabled: Arc<std::sync::atomic::AtomicBool>) {}
+
     /// Ordered, tail-signaled WR groups and source-identified immediate events.
     fn supports_write_batch(&self) -> bool {
         false

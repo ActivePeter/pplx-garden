@@ -4,7 +4,10 @@ use std::{
     mem::{MaybeUninit, transmute},
     ptr::{NonNull, null_mut},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use bytes::Bytes;
@@ -52,6 +55,7 @@ pub struct EfaDomain {
     peer_groups: HashMap<PeerGroupHandle, PeerGroup>,
     local_mr_map: HashMap<NonNull<c_void>, NonNull<fid_mr>>,
     imm_count_map: Arc<ImmCountMap>,
+    connection_admission: Arc<AtomicBool>,
     objpool_write_op: ObjectPool<WriteOpContext>,
     objpool_msg: ObjectPool<RmaBuffer>,
 
@@ -243,6 +247,7 @@ impl EfaDomain {
                 objpool_write_op: ObjectPool::with_chunk_size(1024),
                 objpool_msg: ObjectPool::with_chunk_size(1024),
                 imm_count_map,
+                connection_admission: Arc::new(AtomicBool::new(true)),
 
                 recv_ops: VecDeque::new(),
                 send_ops: VecDeque::new(),
@@ -260,6 +265,9 @@ impl EfaDomain {
         match self.peer_addr_map.entry(peer_addr.clone()) {
             Entry::Occupied(entry) => Ok(*entry.get()),
             Entry::Vacant(entry) => unsafe {
+                if !self.connection_admission.load(Ordering::Acquire) {
+                    return Err(FabricLibError::Custom("new RDMA peer addresses are frozen"));
+                }
                 let fi_av_insert = (*(*self.av.as_ptr()).ops).insert.unwrap_unchecked();
                 let mut addr_id: fi_addr_t = FI_ADDR_UNSPEC;
                 let ret = fi_av_insert(
@@ -719,6 +727,10 @@ impl EfaDomain {
 
 impl RdmaDomain for EfaDomain {
     type Info = EfaDomainInfo;
+
+    fn set_connection_admission(&mut self, enabled: Arc<AtomicBool>) {
+        self.connection_admission = enabled;
+    }
 
     fn open(info: Self::Info, imm_count_map: Arc<ImmCountMap>) -> Result<Self> {
         Self::open(info, imm_count_map)

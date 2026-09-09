@@ -72,6 +72,16 @@ fn check_write_budget(used: usize, required: usize) -> Result<()> {
 }
 
 impl FabricEngine {
+    /// Control creation of new peer resources on every worker/domain.
+    ///
+    /// Disabling this leaves established resources usable and does not cancel admitted work.
+    /// The caller still owns operation admission, expiry, and draining.
+    pub fn set_connection_admission(&self, enabled: bool) {
+        for context in self.workers.values() {
+            context.worker.connection_admission.store(enabled, SeqCst);
+        }
+    }
+
     pub fn new(workers: Vec<(u8, Worker)>) -> Result<Self> {
         Self::new_inner(workers, false)
     }

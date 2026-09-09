@@ -100,6 +100,12 @@ enum CompletionCpuPolicy {
 }
 
 impl TransferEngine {
+    /// Freeze or resume new peer resources without closing established connections.
+    /// This is not an operation-admission or shutdown barrier.
+    pub fn set_connection_admission(&self, enabled: bool) {
+        self.engine.set_connection_admission(enabled);
+    }
+
     pub fn new(workers: Vec<(u8, Worker)>) -> Result<Self> {
         Self::new_with_completion_cpu(workers, None)
     }

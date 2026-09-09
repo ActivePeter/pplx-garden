@@ -4,7 +4,10 @@ use std::{
     mem::{MaybeUninit, transmute},
     ptr::{NonNull, null_mut},
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -99,6 +102,7 @@ pub struct VerbsDomain {
     peer_groups: HashMap<PeerGroupHandle, PeerGroup>,
     local_mr_map: HashMap<NonNull<c_void>, NonNull<ibv_mr>>,
     imm_count_map: Arc<ImmCountMap>,
+    connection_admission: Arc<AtomicBool>,
     objpool_write_op: ObjectPool<WriteOpContext>,
     objpool_wr: ObjectPool<WrChainBuffer>,
     objpool_pending_group_write_op: ObjectPool<PendingGroupWriteOp>,
@@ -374,6 +378,7 @@ impl VerbsDomain {
                 peer_groups: HashMap::new(),
                 local_mr_map: HashMap::new(),
                 imm_count_map,
+                connection_admission: Arc::new(AtomicBool::new(true)),
                 objpool_write_op: ObjectPool::with_chunk_size(MAX_OPS),
                 objpool_wr: ObjectPool::with_chunk_size(MAX_OPS),
                 objpool_pending_group_write_op: ObjectPool::with_chunk_size(MAX_OPS),
@@ -496,6 +501,9 @@ impl VerbsDomain {
         pending_submits: Vec<(TransferId, OutboundOp)>,
         pending_group_write_ops: Vec<NonNull<PendingGroupWriteOp>>,
     ) -> Result<Peer> {
+        if !self.connection_admission.load(Ordering::Acquire) {
+            return Err(FabricLibError::Custom("new RDMA peers are frozen"));
+        }
         let peer_ud_addr = VerbsUDAddress::from_bytes(&peer_addr.0)
             .ok_or(FabricLibError::Custom("Invalid peer address"))?;
 
@@ -1443,6 +1451,10 @@ impl VerbsDomain {
 
 impl RdmaDomain for VerbsDomain {
     type Info = VerbsDeviceInfo;
+
+    fn set_connection_admission(&mut self, enabled: Arc<AtomicBool>) {
+        self.connection_admission = enabled;
+    }
 
     fn open(info: Self::Info, imm_count_map: Arc<ImmCountMap>) -> Result<Self> {
         Self::open(info, imm_count_map)
